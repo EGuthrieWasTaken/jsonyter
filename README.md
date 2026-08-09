@@ -60,6 +60,19 @@ except JupyterError as err:
     err.to_json()  # {"error": "JupyterError", "message": "...", "status": 404, "url": "..."}
 ```
 
+Every public method also takes `pretty` (default `False`); with
+`pretty=True` it returns an indented JSON string instead of the Python object,
+handy at an interactive prompt:
+
+```python
+print(client.status(pretty=True))
+# {
+#   "connections": 0,
+#   "kernels": 0,
+#   ...
+# }
+```
+
 Rich output arrives as Jupyter mimebundles (`{"text/plain": ..., "image/png":
 base64, "text/html": ...}`) inside `display_data`/`execute_result` outputs;
 the front end picks the representation it can render.
@@ -82,7 +95,9 @@ One JSON request per line in, one JSON response per line out:
 
 If executed code calls `input()`, the bridge emits
 `{"id": 2, "input_request": {"prompt": "? ", "password": false}}` and waits for
-a `{"input": "the answer"}` line before the final result. Errors come back as
+a `{"input": "the answer"}` line before the final result. Pass `--pretty` to
+indent responses when driving the bridge by hand (editors should not use it —
+it breaks the one-line-per-response framing). Errors come back as
 `{"id": N, "error": {...}}` and never kill the process. Send
 `{"id": 0, "method": "methods"}` to list every available method.
 

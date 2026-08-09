@@ -2,9 +2,29 @@
 
 All methods return the server's JSON responses as plain Python objects
 (dicts/lists), so every return value round-trips through ``json.dumps``.
+Pass ``pretty=True`` to any public method to get an indented JSON string
+instead (defaults to False).
 """
 
+import functools
+import json
+
 import requests
+
+
+def prettifiable(method):
+    """Give ``method`` a ``pretty`` keyword (default False).
+
+    With ``pretty=True`` the method returns ``json.dumps(result, indent=2,
+    sort_keys=True)`` instead of the plain Python object.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, pretty=False, **kwargs):
+        result = method(self, *args, **kwargs)
+        if pretty:
+            return json.dumps(result, indent=2, sort_keys=True)
+        return result
+    return wrapper
 
 
 class JupyterError(Exception):
@@ -76,46 +96,57 @@ class Client:
 
     # ---------------------------------------------------------------- server
 
+    @prettifiable
     def status(self):
         """Server status: version, started, number of kernels, etc."""
         return self._get("/api/status")
 
+    @prettifiable
     def version(self):
         return self._get("/api")
 
     # --------------------------------------------------------------- kernels
 
+    @prettifiable
     def list_kernelspecs(self):
         """Available kernel types (name, display name, language, ...)."""
         return self._get("/api/kernelspecs")
 
+    @prettifiable
     def list_kernels(self):
         return self._get("/api/kernels")
 
+    @prettifiable
     def start_kernel(self, name=None):
         """Start a kernel; ``name`` defaults to the server's default spec."""
         body = {"name": name} if name else {}
         return self._post("/api/kernels", body)
 
+    @prettifiable
     def get_kernel(self, kernel_id):
         return self._get("/api/kernels/" + kernel_id)
 
+    @prettifiable
     def shutdown_kernel(self, kernel_id):
         self._delete("/api/kernels/" + kernel_id)
         return {"id": kernel_id, "shutdown": True}
 
+    @prettifiable
     def restart_kernel(self, kernel_id):
         return self._post("/api/kernels/" + kernel_id + "/restart")
 
+    @prettifiable
     def interrupt_kernel(self, kernel_id):
         self._post("/api/kernels/" + kernel_id + "/interrupt")
         return {"id": kernel_id, "interrupted": True}
 
     # -------------------------------------------------------------- sessions
 
+    @prettifiable
     def list_sessions(self):
         return self._get("/api/sessions")
 
+    @prettifiable
     def create_session(self, path, kernel_name=None, session_type="console",
                        name=""):
         """Create a named session bound to a (possibly new) kernel.
@@ -129,15 +160,18 @@ class Client:
             "kernel": {"name": kernel_name} if kernel_name else {},
         })
 
+    @prettifiable
     def get_session(self, session_id):
         return self._get("/api/sessions/" + session_id)
 
+    @prettifiable
     def delete_session(self, session_id):
         self._delete("/api/sessions/" + session_id)
         return {"id": session_id, "deleted": True}
 
     # -------------------------------------------------------------- contents
 
+    @prettifiable
     def get_contents(self, path="", content=True):
         """File/notebook contents at ``path`` (notebooks come back as JSON)."""
         params = {"content": "1" if content else "0"}

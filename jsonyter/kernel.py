@@ -10,7 +10,7 @@ import json
 import websocket
 
 from . import messages
-from .client import JupyterError
+from .client import JupyterError, prettifiable
 
 
 class KernelConnection:
@@ -97,6 +97,7 @@ class KernelConnection:
 
     # --------------------------------------------------------------- execute
 
+    @prettifiable
     def execute(self, code, timeout=None, silent=False, store_history=True,
                 stdin_callback=None):
         """Run ``code`` and collect everything the kernel says about it.
@@ -178,12 +179,14 @@ class KernelConnection:
 
     # ---------------------------------------------------------- introspection
 
+    @prettifiable
     def complete(self, code, cursor_pos=None, timeout=None):
         """Completion candidates at ``cursor_pos`` (default: end of code)."""
         return self._request_reply(
             messages.complete_request(self.session_id, code, cursor_pos),
             timeout)
 
+    @prettifiable
     def inspect(self, code, cursor_pos=None, detail_level=0, timeout=None):
         """Documentation/introspection for the object at ``cursor_pos``."""
         return self._request_reply(
@@ -191,15 +194,18 @@ class KernelConnection:
                                      detail_level),
             timeout)
 
+    @prettifiable
     def is_complete(self, code, timeout=None):
         """Whether ``code`` is complete input (drives REPL Enter behavior)."""
         return self._request_reply(
             messages.is_complete_request(self.session_id, code), timeout)
 
+    @prettifiable
     def kernel_info(self, timeout=None):
         return self._request_reply(
             messages.kernel_info_request(self.session_id), timeout)
 
+    @prettifiable
     def history(self, n=50, timeout=None, **kwargs):
         return self._request_reply(
             messages.history_request(self.session_id, n=n, **kwargs), timeout)

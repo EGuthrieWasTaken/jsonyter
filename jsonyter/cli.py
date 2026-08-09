@@ -63,14 +63,16 @@ _KERNEL_METHODS = {
 
 
 class Dispatcher:
-    def __init__(self, client, stdin=None, stdout=None):
+    def __init__(self, client, stdin=None, stdout=None, pretty=False):
         self.client = client
         self.connections = {}
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
+        self.pretty = pretty
 
     def _emit(self, obj):
-        self.stdout.write(json.dumps(obj) + "\n")
+        self.stdout.write(json.dumps(obj, indent=2 if self.pretty else None)
+                          + "\n")
         self.stdout.flush()
 
     def _connection(self, kernel_id):
@@ -157,11 +159,14 @@ def main(argv=None):
                         help="default request timeout in seconds")
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS certificate verification")
+    parser.add_argument("--pretty", action="store_true",
+                        help="indent JSON responses (for humans; breaks the "
+                             "one-line-per-response protocol editors rely on)")
     args = parser.parse_args(argv)
 
     client = Client(args.url, token=args.token, timeout=args.timeout,
                     verify_tls=not args.insecure)
-    dispatcher = Dispatcher(client)
+    dispatcher = Dispatcher(client, pretty=args.pretty)
     try:
         dispatcher.run()
     except KeyboardInterrupt:
