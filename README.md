@@ -77,10 +77,45 @@ Rich output arrives as Jupyter mimebundles (`{"text/plain": ..., "image/png":
 base64, "text/html": ...}`) inside `display_data`/`execute_result` outputs;
 the front end picks the representation it can render.
 
+### Timeouts
+
+`Client` takes two independent timeouts:
+
+- `timeout` (default `10.0`s) bounds REST calls (`status`, `start_kernel`, ...)
+  and the initial WebSocket handshake. Keep this short so a dead/unreachable
+  server fails fast.
+- `exec_timeout` (default `None`) is the default wait for a kernel reply on
+  `execute`/`complete`/`inspect`/`is_complete`/`kernel_info`/`history`,
+  measured as *silence since the last message* — receiving any message,
+  including intermediate stream output, resets the clock, so it isn't a cap
+  on total run time. It defaults to waiting indefinitely, since a REPL
+  shouldn't impose an arbitrary deadline on someone's code, and some kernels
+  (e.g. SAS) can take a long time just to become responsive on a fresh
+  connection.
+
+```python
+client = Client("https://jupyter.example.com", token="...", exec_timeout=120)
+```
+
+Every kernel method also takes a per-call `timeout=` that overrides the
+client default for just that call:
+
+```python
+conn.execute(sas_code, timeout=300)   # this call only
+conn.execute(quick_code)              # falls back to client.exec_timeout
+```
+
+If a kernel is genuinely stuck rather than just slow, reclaim it with
+`client.interrupt_kernel(kernel_id)` or `client.restart_kernel(kernel_id)`
+instead of guessing a timeout.
+
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
 jsonyter --url http://localhost:8888 --token SECRET
+# slow kernel (e.g. SAS): give execute/etc a generous default, or omit
+# --exec-timeout entirely to wait indefinitely (the default)
+jsonyter --url https://jupyter.example.com --token SECRET --exec-timeout 120
 ```
 
 One JSON request per line in, one JSON response per line out:

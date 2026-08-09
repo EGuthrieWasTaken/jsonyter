@@ -75,18 +75,28 @@ class KernelConnection:
         return msg["header"]["msg_id"]
 
     def _recv(self, timeout):
+        # None means block indefinitely — the same convention as socket
+        # timeouts, so a caller can opt into "wait forever" explicitly.
         self._ws.settimeout(timeout)
         try:
             raw = self._ws.recv()
         except websocket.WebSocketTimeoutException as exc:
             raise JupyterError(
-                "timed out waiting for kernel reply", url=self.ws_url,
+                "timed out after {}s waiting for a kernel reply "
+                "(no message arrived in that window; pass a larger "
+                "timeout=, or timeout=None to wait indefinitely — some "
+                "kernels, e.g. SAS, are slow to respond on a fresh "
+                "connection)".format(timeout),
+                url=self.ws_url,
             ) from exc
         return json.loads(raw)
 
+    def _resolve_timeout(self, timeout):
+        return timeout if timeout is not None else self.client.exec_timeout
+
     def _request_reply(self, msg, timeout=None):
         """Send ``msg`` and return the matching ``*_reply`` content."""
-        timeout = timeout if timeout is not None else self.client.timeout
+        timeout = self._resolve_timeout(timeout)
         msg_id = self._send(msg)
         reply_type = msg["header"]["msg_type"].replace("_request", "_reply")
         while True:
@@ -119,8 +129,14 @@ class KernelConnection:
         ``input_request`` content (``{"prompt": ..., "password": ...}``) and
         must return the string to send back — this is how ``input()`` works
         from a connected REPL.
+
+        ``timeout`` bounds how long to wait with no message from the kernel
+        (see :class:`Client` for the default and rationale); it defaults to
+        ``client.exec_timeout``, which is ``None`` (wait indefinitely) unless
+        you configured otherwise. A genuinely stuck kernel should be reclaimed
+        with ``interrupt_kernel``/``restart_kernel``, not a timeout guess.
         """
-        timeout = timeout if timeout is not None else self.client.timeout
+        timeout = self._resolve_timeout(timeout)
         msg = messages.execute_request(
             self.session_id, code, silent=silent, store_history=store_history,
             allow_stdin=stdin_callback is not None,

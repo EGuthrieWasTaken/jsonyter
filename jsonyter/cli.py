@@ -156,7 +156,15 @@ def main(argv=None):
     parser.add_argument("--token", default=None,
                         help="Jupyter auth token (or set in the URL provider)")
     parser.add_argument("--timeout", type=float, default=30.0,
-                        help="default request timeout in seconds")
+                        help="timeout in seconds for REST calls and the "
+                             "WebSocket handshake (not kernel execution)")
+    parser.add_argument("--exec-timeout", type=float, default=None,
+                        help="default timeout in seconds to wait for a "
+                             "kernel reply on execute/complete/inspect/etc, "
+                             "measured as silence since the last message "
+                             "(not total run time); omit for no timeout "
+                             "(wait indefinitely — the default, since some "
+                             "kernels such as SAS are slow to respond)")
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS certificate verification")
     parser.add_argument("--pretty", action="store_true",
@@ -165,6 +173,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     client = Client(args.url, token=args.token, timeout=args.timeout,
+                    exec_timeout=args.exec_timeout,
                     verify_tls=not args.insecure)
     dispatcher = Dispatcher(client, pretty=args.pretty)
     try:
