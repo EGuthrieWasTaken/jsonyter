@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsonyter"
+version = "0.1.0"
+description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ethan Guthrie" }]
+dependencies = [
+    "requests>=2.25",
+    "websocket-client>=1.2",
+]
+
+[project.scripts]
+jsonyter = "jsonyter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jsonyter*"]
