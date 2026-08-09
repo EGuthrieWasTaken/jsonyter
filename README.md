@@ -77,6 +77,42 @@ Rich output arrives as Jupyter mimebundles (`{"text/plain": ..., "image/png":
 base64, "text/html": ...}`) inside `display_data`/`execute_result` outputs;
 the front end picks the representation it can render.
 
+### Streaming output
+
+`execute` blocks until the cell finishes, but `on_output` fires as each output
+arrives, so a long-running cell can render `print` output while it runs
+instead of dumping it at the end:
+
+```python
+conn.execute(slow_code, on_output=lambda out: render(out))
+```
+
+The same dicts still appear in the returned `outputs`, so the callback is
+purely additive.
+
+### Async kernel events
+
+A background thread pumps the kernel socket, so kernel state is observable
+without polling `get_kernel` and without an `execute` in flight:
+
+```python
+conn.add_listener(lambda ev: print(ev))
+# {"type": "status", "execution_state": "busy", "kernel_id": "..."}
+# {"type": "status", "execution_state": "idle", "kernel_id": "..."}
+# {"type": "dead", "kernel_id": "...", "restart": false}   <- kernel shut down
+# {"type": "disconnected", "message": "..."}               <- socket dropped
+conn.execution_state   # last seen state, or None
+```
+
+A server often keeps the socket open for a moment after a kernel goes away, so
+`dead` (from the kernel's `shutdown_reply`) is the timely death signal;
+`disconnected` follows whenever the socket itself drops.
+
+Because the pump owns the socket, another thread may call
+`client.interrupt_kernel(kernel_id)` while `execute` is blocked — that's the
+supported way to stop a runaway cell. Listener callbacks run on the pump
+thread and must not block.
+
 ### Timeouts
 
 `Client` takes two independent timeouts:
@@ -112,10 +148,10 @@ instead of guessing a timeout.
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
-jsonyter --url http://localhost:8888 --token SECRET
+JUPYTER_TOKEN=SECRET jsonyter --url http://localhost:8888
 # slow kernel (e.g. SAS): give execute/etc a generous default, or omit
 # --exec-timeout entirely to wait indefinitely (the default)
-jsonyter --url https://jupyter.example.com --token SECRET --exec-timeout 120
+JUPYTER_TOKEN=SECRET jsonyter --url https://jupyter.example.com --exec-timeout 120
 ```
 
 One JSON request per line in, one JSON response per line out:
@@ -128,73 +164,87 @@ One JSON request per line in, one JSON response per line out:
 {"id": 2, "result": {"status": "ok", "execution_count": 1, "outputs": [{"type": "execute_result", "data": {"text/plain": "2"}, "metadata": {}, "execution_count": 1}]}}
 ```
 
-If executed code calls `input()`, the bridge emits
-`{"id": 2, "input_request": {"prompt": "? ", "password": false}}` and waits for
-a `{"input": "the answer"}` line before the final result. Pass `--pretty` to
-indent responses when driving the bridge by hand (editors should not use it —
-it breaks the one-line-per-response framing). Errors come back as
-`{"id": N, "error": {...}}` and never kill the process. Send
-`{"id": 0, "method": "methods"}` to list every available method.
+Errors come back as `{"id": N, "error": {...}}` and never kill the process.
+Send `{"id": 0, "method": "methods"}` to list every available method. Pass
+`--pretty` to indent responses when driving the bridge by hand (editors should
+not use it — it breaks the one-line-per-response framing).
 
-## Emacs sketch
+### Line types
 
-A minimal comint-free REPL loop — enough to show the shape of the integration:
+Every line is a JSON object. Dispatch on which key is present — anything that
+is not `result`/`error` is out-of-band and does not complete the request:
 
-```elisp
-(defvar jsonyter--proc nil)
-(defvar jsonyter--kernel-id nil)
-(defvar jsonyter--callbacks (make-hash-table :test #'eql))
-(defvar jsonyter--next-id 0)
-(defvar jsonyter--buffer "")
+| Key | Meaning |
+| --- | --- |
+| `result` | final success response for `id` |
+| `error` | final failure response for `id` |
+| `output` | incremental output from a running `execute` |
+| `input_request` | the kernel wants stdin; reply before it can finish |
+| `event` | async kernel state, after `subscribe` |
 
-(defun jsonyter-start (url token)
-  (setq jsonyter--proc
-        (make-process
-         :name "jsonyter"
-         :command (list "jsonyter" "--url" url "--token" token)
-         :connection-type 'pipe
-         :filter #'jsonyter--filter))
-  (jsonyter-request "start_kernel" '(:name "python3")
-                    (lambda (reply)
-                      (setq jsonyter--kernel-id
-                            (plist-get (plist-get reply :result) :id)))))
+### Concurrency
 
-(defun jsonyter-request (method params callback)
-  (let ((id (cl-incf jsonyter--next-id)))
-    (puthash id callback jsonyter--callbacks)
-    (process-send-string
-     jsonyter--proc
-     (concat (json-serialize (list :id id :method method :params params))
-             "\n"))))
+Requests are handled concurrently: REST calls run on a small pool and each
+kernel gets its own worker, so a blocked `execute` never stops the bridge from
+reading stdin. You can send `interrupt_kernel` down the same pipe while code
+is running and it is acted on immediately — no second "control" process
+needed. **Responses may therefore arrive out of request order**; match them by
+`id`.
 
-(defun jsonyter--filter (_proc chunk)
-  (setq jsonyter--buffer (concat jsonyter--buffer chunk))
-  (while (string-match "\\(.*\\)\n" jsonyter--buffer)
-    (let* ((line (match-string 1 jsonyter--buffer))
-           (reply (json-parse-string line :object-type 'plist)))
-      (setq jsonyter--buffer (substring jsonyter--buffer (match-end 0)))
-      (when-let ((cb (gethash (plist-get reply :id) jsonyter--callbacks)))
-        (unless (plist-get reply :input_request) ; final reply -> pop callback
-          (remhash (plist-get reply :id) jsonyter--callbacks))
-        (funcall cb reply)))))
-
-(defun jsonyter-eval (code)
-  (interactive "sPython: ")
-  (jsonyter-request
-   "execute" (list :kernel_id jsonyter--kernel-id :code code)
-   (lambda (reply)
-     (dolist (output (append (plist-get (plist-get reply :result) :outputs) nil))
-       (pcase (plist-get output :type)
-         ("stream" (message "%s" (plist-get output :text)))
-         ("execute_result"
-          (message "=> %s" (plist-get (plist-get output :data) :text/plain)))
-         ("error" (message "%s" (plist-get output :evalue))))))))
+```json
+{"id": 2, "method": "execute", "params": {"kernel_id": "8fca...", "code": "while True: pass"}}
+{"id": 3, "method": "interrupt_kernel", "params": {"kernel_id": "8fca..."}}
+{"id": 3, "result": {"id": "8fca...", "interrupted": true}}
+{"id": 2, "result": {"status": "error", "outputs": [{"type": "error", "ename": "KeyboardInterrupt", ...}]}}
 ```
 
-A real mode would render `is_complete` on RET, feed `complete` into
-`completion-at-point`, show `inspect` in eldoc, and decode `image/png`
-mimebundles into inline images — all of which are single `jsonyter-request`
-calls with the plumbing above.
+### Streaming and events
+
+Add `"stream": true` to an `execute` (or start the bridge with `--stream` to
+make it the default) to get output as it is produced:
+
+```json
+{"id": 2, "method": "execute", "params": {"kernel_id": "8fca...", "code": "print('a'); print('b')", "stream": true}}
+{"id": 2, "output": {"type": "stream", "name": "stdout", "text": "a\n"}}
+{"id": 2, "output": {"type": "stream", "name": "stdout", "text": "b\n"}}
+{"id": 2, "result": {"status": "ok", "execution_count": 1, "outputs": [ ...same two outputs... ]}}
+```
+
+`subscribe` reports kernel state transitions as they happen, so a front end
+can show busy/idle (or notice a dead kernel) without polling:
+
+```json
+{"id": 4, "method": "subscribe", "params": {"kernel_id": "8fca..."}}
+{"id": 4, "result": {"kernel_id": "8fca...", "subscribed": true, "execution_state": "idle"}}
+{"kernel_id": "8fca...", "event": {"type": "status", "execution_state": "busy"}}
+{"kernel_id": "8fca...", "event": {"type": "status", "execution_state": "idle"}}
+{"kernel_id": "8fca...", "event": {"type": "dead", "restart": false}}
+{"kernel_id": "8fca...", "event": {"type": "disconnected", "message": "..."}}
+```
+
+### stdin
+
+If executed code calls `input()`, the bridge emits
+`{"id": 2, "input_request": {"prompt": "? ", "password": false}}` and waits for
+`{"id": 2, "input": "the answer"}` before the final result. A bare
+`{"input": "..."}` still works when only one request is waiting.
+
+### Tokens
+
+`--token` is still accepted but puts the secret in the process's argv, where
+any local user can read it with `ps` — which defeats a gpg-encrypted token
+file. Prefer either:
+
+```bash
+JUPYTER_TOKEN=$(gpg -qd ~/.jupyter-token.gpg) jsonyter --url ...   # env
+gpg -qd ~/.jupyter-token.gpg | jsonyter --token-file - --url ...   # first stdin line
+jsonyter --token-file ~/.jupyter/token --url ...                   # a file
+```
+
+An editor spawning the bridge should set `JUPYTER_TOKEN` in the subprocess
+environment rather than passing `--token` on the command line. The `Client`
+class reads `JUPYTER_TOKEN` too, so library code never needs a hardcoded token
+either.
 
 ## API surface
 
@@ -205,6 +255,7 @@ calls with the plumbing above.
 | Sessions | `list_sessions`, `create_session`, `get_session`, `delete_session` |
 | Contents | `get_contents` |
 | Kernel (WebSocket) | `execute`, `complete`, `inspect`, `is_complete`, `kernel_info`, `history` |
+| Events | `add_listener`/`remove_listener` (library), `subscribe`/`unsubscribe` (bridge) |
 
 The kernel channel speaks the [Jupyter messaging protocol](https://jupyter-client.readthedocs.io/en/stable/messaging.html)
 v5.3; message construction lives in `jsonyter/messages.py` if you need a

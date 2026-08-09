@@ -8,6 +8,7 @@ instead (defaults to False).
 
 import functools
 import json
+import os
 
 import requests
 
@@ -72,7 +73,15 @@ class Client:
         ``interrupt_kernel`` to reclaim a kernel that's actually stuck, or
         pass a finite ``exec_timeout``/per-call ``timeout`` if you want calls
         to give up on their own.
+
+        ``token`` falls back to the ``JUPYTER_TOKEN`` environment variable
+        when not given, so it never has to be hardcoded in a script. Pass
+        ``token=False`` for an explicitly unauthenticated server.
         """
+        if token is None:
+            token = os.environ.get("JUPYTER_TOKEN") or None
+        elif token is False:
+            token = None
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
