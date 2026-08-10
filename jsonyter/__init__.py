@@ -8,7 +8,9 @@ Emacs REPL driven over a JSON pipe (see ``jsonyter.cli``).
 
 from .client import Client, JupyterError
 from .kernel import KernelConnection
+from .notebook import NotebookConflict, file_hash, read_notebook, write_notebook
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-__all__ = ["Client", "KernelConnection", "JupyterError", "__version__"]
+__all__ = ["Client", "KernelConnection", "JupyterError", "NotebookConflict",
+           "read_notebook", "write_notebook", "file_hash", "__version__"]

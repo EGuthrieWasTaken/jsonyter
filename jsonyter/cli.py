@@ -40,6 +40,9 @@ Available methods (params in parentheses):
   ``is_complete`` (``kernel_id``, ``code``), ``kernel_info`` (``kernel_id``)
 - ``subscribe``/``unsubscribe`` (``kernel_id``) — async kernel status events
 - ``disconnect`` (``kernel_id``) — close the websocket but leave the kernel up
+- ``read_notebook`` (``path``), ``write_notebook`` (``path``, ``cells``,
+  ``expect_hash``), ``notebook_hash`` (``path``) — local ``.ipynb`` files;
+  these need no server and no kernel, so the bridge is usable offline
 """
 
 import argparse
@@ -48,6 +51,7 @@ import os
 import queue
 import sys
 import threading
+import time
 
 from .client import Client, JupyterError
 
@@ -64,6 +68,11 @@ _CLIENT_METHODS = {
     "get_session": ("session_id",),
     "delete_session": ("session_id",),
     "get_contents": ("path", "content"),
+    # Local filesystem, no server contact — and not on a kernel worker, so a
+    # save never queues behind a running execute.
+    "read_notebook": ("path",),
+    "write_notebook": ("path", "cells", "expect_hash"),
+    "notebook_hash": ("path",),
 }
 
 _KERNEL_METHODS = {
@@ -306,16 +315,33 @@ class Dispatcher:
                     continue
             self._rest_queue.put(request)
 
-    def shutdown(self):
+    def shutdown(self, drain_timeout=10.0):
+        """Finish queued work, then tear down.
+
+        Requests already accepted must still be answered: stdin reaching EOF
+        (a one-shot invocation, or the editor quitting) would otherwise kill
+        the worker threads mid-flight and silently drop their responses. The
+        sentinels queue behind the outstanding work, so joining the workers
+        drains it; the deadline keeps a long-running execute from blocking
+        exit forever.
+        """
         self._stopping = True
         with self._state_lock:
             workers = list(self._workers.values())
-            connections = list(self.connections.values())
-            self.connections.clear()
         for work, _thread in workers:
             work.put(None)
         for _ in self._rest_workers:
             self._rest_queue.put(None)
+
+        deadline = time.monotonic() + drain_timeout
+        for _work, thread in workers:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for thread in self._rest_workers:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        with self._state_lock:
+            connections = list(self.connections.values())
+            self.connections.clear()
         for conn in connections:
             try:
                 conn.close()

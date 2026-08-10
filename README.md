@@ -16,9 +16,11 @@ with `make-process` and parse replies with `json-parse-string`.
 pip install -e .
 ```
 
-Dependencies: `requests` (REST API) and `websocket-client` (kernel channels).
-You also need a Jupyter server to talk to, e.g. `pip install jupyter-server ipykernel`
-then `jupyter server --ServerApp.token=SECRET`.
+Dependencies: `requests` (REST API), `websocket-client` (kernel channels) and
+`nbformat` (local `.ipynb` read/write). You also need a Jupyter server to talk
+to, e.g. `pip install jupyter-server ipykernel` then
+`jupyter server --ServerApp.token=SECRET` — though the notebook file methods
+work without one.
 
 ## Library usage
 
@@ -168,6 +170,60 @@ python3, ir, julia and sas). The library deliberately doesn't append the
 newline for you — it's a thin protocol wrapper, and rewriting user code is the
 front end's call.
 
+## Local notebook files
+
+Reading and writing `.ipynb` files are plain filesystem operations — **no
+server and no kernel are needed**, so an offline editor can still save. They
+exist because serialization has to happen on the Python side: `nbformat`
+round-trips a notebook byte-identically, while a naive JSON re-encode
+collapses Jupyter's indentation and turns every save into a whole-file diff.
+
+```python
+client.write_notebook("/path/nb.ipynb", [
+    {"id": "a1b2c3", "cell_type": "code",     "source": "print(1)"},
+    {"id": "d4e5f6", "cell_type": "markdown", "source": "# heading"},
+    {"id": None,     "cell_type": "code",     "source": "new cell"},
+])
+# {"path": "...", "cells": ["a1b2c3", "d4e5f6", "9z8y7x"],
+#  "written": True, "hash": "sha256..."}
+```
+
+The client sends cell **source only**. `write_notebook` is a read-modify-write
+against the file on disk and rebuilds the cell list in the order given:
+
+- an `id` matching an existing cell **reuses that cell**, replacing only
+  `source` — its `outputs`, `execution_count`, `metadata` and `attachments`
+  survive, so reordering and editing preserve results;
+- `id: null` or an unknown id creates a fresh cell;
+- an existing cell not in the list is deleted;
+- a changed `cell_type` drops that cell's `outputs` and `execution_count`
+  (and `attachments` when becoming code, which can't carry them).
+
+Notebook-level `metadata`, `nbformat` and `nbformat_minor` are preserved.
+Notebooks older than nbformat 4.5 have no cell ids, so cells are matched by
+position instead and no ids are written back.
+
+**Outputs are never written.** Execution results are session-only; stored
+outputs in the file are preserved but never updated. There is deliberately no
+output-writing path.
+
+Writes go to a temp file in the same directory and are moved into place with
+`os.replace`, so an interrupted save can never truncate the original, and the
+notebook is validated before any of that happens. Pass `expect_hash` (the
+sha256 the client last saw, also returned by `notebook_hash`) to guard against
+clobbering an external edit:
+
+```python
+client.write_notebook(path, cells, expect_hash=last_seen)
+# raises NotebookConflict if the file changed; nothing is written
+```
+
+`read_notebook(path)` returns the notebook as normalized nbformat v4 with an
+id guaranteed on every cell — its job is older notebooks (nbformat 3, or
+4.0–4.4 without ids), since the merge above depends on ids existing. The file
+itself is not modified. A `write_notebook` to a path that doesn't exist yet
+creates the notebook.
+
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
@@ -277,6 +333,7 @@ either.
 | Kernels (REST) | `list_kernelspecs`, `list_kernels`, `start_kernel`, `get_kernel`, `shutdown_kernel`, `restart_kernel`, `interrupt_kernel` |
 | Sessions | `list_sessions`, `create_session`, `get_session`, `delete_session` |
 | Contents | `get_contents` |
+| Notebooks (local files) | `read_notebook`, `write_notebook`, `notebook_hash` |
 | Kernel (WebSocket) | `execute`, `complete`, `inspect`, `is_complete`, `kernel_info`, `history` |
 | Events | `add_listener`/`remove_listener` (library), `subscribe`/`unsubscribe` (bridge) |
 

@@ -214,6 +214,27 @@ class Client:
         params = {"content": "1" if content else "0"}
         return self._get("/api/contents/" + path.lstrip("/"), params=params)
 
+    # ------------------------------------------------------- local notebooks
+    # Filesystem operations: no server contact, so they work offline.
+
+    @prettifiable
+    def read_notebook(self, path):
+        """Local ``.ipynb`` as normalized v4 JSON, every cell carrying an id."""
+        from .notebook import read_notebook
+        return read_notebook(path)
+
+    @prettifiable
+    def write_notebook(self, path, cells, expect_hash=None):
+        """Merge cell ``source`` into a local ``.ipynb``, preserving outputs."""
+        from .notebook import write_notebook
+        return write_notebook(path, cells, expect_hash=expect_hash)
+
+    @prettifiable
+    def notebook_hash(self, path):
+        """sha256 of a local notebook, for the ``expect_hash`` staleness guard."""
+        from .notebook import file_hash
+        return {"path": path, "hash": file_hash(path)}
+
     # --------------------------------------------------------------- kernels'
     # websocket connections
 

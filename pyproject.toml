@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jsonyter"
-version = "0.1.0"
+version = "0.2.0"
 description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +13,7 @@ authors = [{ name = "Ethan Guthrie" }]
 dependencies = [
     "requests>=2.25",
     "websocket-client>=1.2",
+    "nbformat>=5.1",
 ]
 
 [project.scripts]
