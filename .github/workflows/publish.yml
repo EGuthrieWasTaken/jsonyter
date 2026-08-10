@@ -1,0 +1,66 @@
+name: Build and publish
+
+# Every push/PR builds and verifies the package, so packaging problems
+# surface before a release. Publishing to PyPI only happens when a GitHub
+# Release is published, via Trusted Publishing (OIDC) — no stored token.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - name: Smoke-test the built wheel
+        run: |
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv/bin/python dist/*.whl
+          .smoke-venv/bin/python -c "import jsonyter; print(jsonyter.__version__)"
+          .smoke-venv/bin/jsonyter --help
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    # Guard belt-and-suspenders: the PyPI-side Trusted Publisher config also
+    # restricts which workflow/environment may claim an OIDC token, so this
+    # `if` isn't the only thing standing between a stray push and a release.
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/jsonyter/
+    permissions:
+      id-token: write  # required for OIDC Trusted Publishing; no API token needed
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

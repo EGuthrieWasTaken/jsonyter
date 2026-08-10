@@ -8,7 +8,8 @@ version = "1.0.0"
 description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "GPLv3" }
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "Ethan Guthrie" }]
 keywords = ["jupyter", "emacs", "repl", "notebook", "json"]
 classifiers = [
@@ -44,5 +45,5 @@ Issues = "https://github.com/EGuthrieWasTaken/jsonyter/issues"
 [project.scripts]
 jsonyter = "jsonyter.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["jsonyter*"]
+[tool.uv.build-backend]
+module-root = ""

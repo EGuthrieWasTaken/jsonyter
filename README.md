@@ -10,17 +10,41 @@ JSON, Emacs in particular: the bundled `jsonyter` command exposes the whole
 library as a line-oriented JSON protocol over stdin/stdout, so Emacs can run it
 with `make-process` and parse replies with `json-parse-string`.
 
+> **A note on how this was built.** The bulk of jsonyter was written by
+> Claude Fable 5, an Anthropic AI model, working iteratively with the
+> project's maintainer over the course of development — design decisions,
+> requirements and review were mine; the code, and much of the
+> exploratory verification behind it, were largely the model's.
+
 ## Install
 
 ```bash
-pip install -e .
+pip install jsonyter
+# or
+uv add jsonyter
 ```
 
+Both install the latest release from PyPI; use whichever matches the rest of
+your workflow.
+
+To track the unreleased code in this repo instead — for testing a fix ahead
+of a release, say — install from a checkout:
+
+```bash
+git clone https://github.com/EGuthrieWasTaken/jsonyter.git
+cd jsonyter
+pip install -e .
+# or: uv pip install -e .
+```
+
+The tip of `main` isn't guaranteed to be functional; prefer a tagged release
+unless you specifically need code that hasn't shipped yet.
+
 Dependencies: `requests` (REST API), `websocket-client` (kernel channels) and
-`nbformat` (local `.ipynb` read/write). You also need a Jupyter server to talk
-to, e.g. `pip install jupyter-server ipykernel` then
-`jupyter server --ServerApp.token=SECRET` — though the notebook file methods
-work without one.
+`nbformat` (local `.ipynb` read/write) — all installed automatically. You also
+need a Jupyter server to talk to, e.g. `pip install jupyter-server ipykernel`
+then `jupyter server --ServerApp.token=SECRET` — though the notebook file
+methods work without one.
 
 ## Library usage
 
