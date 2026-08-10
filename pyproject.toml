@@ -1,20 +1,45 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build >= 0.12.1, <0.13.0"]
+build-backend = "uv_build"
 
 [project]
 name = "jsonyter"
-version = "0.2.0"
+version = "1.0.0"
 description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "GPLv3" }
 authors = [{ name = "Ethan Guthrie" }]
+keywords = ["jupyter", "emacs", "repl", "notebook", "json"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: 3.16",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: Jupyter",
+]
 dependencies = [
     "requests>=2.25",
     "websocket-client>=1.2",
     "nbformat>=5.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/EGuthrieWasTaken/jsonyter"
+Repository = "https://github.com/EGuthrieWasTaken/jsonyter"
+Issues = "https://github.com/EGuthrieWasTaken/jsonyter/issues"
 
 [project.scripts]
 jsonyter = "jsonyter.cli:main"
