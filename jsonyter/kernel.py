@@ -34,8 +34,10 @@ class KernelConnection:
         self._listeners = []        # callables receiving event dicts
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._connect_lock = threading.RLock()
         self._pump = None
         self._closing = False
+        self._dead = False
         self.execution_state = None
 
     # ------------------------------------------------------------ connection
@@ -55,36 +57,47 @@ class KernelConnection:
     def connect(self):
         if self.connected:
             return self
-        headers = []
-        if self.client.token:
-            headers.append("Authorization: token " + self.client.token)
-        try:
-            self._ws = websocket.create_connection(
-                self.ws_url, header=headers,
-                timeout=self.client.timeout,
-                sslopt=None if self.client._http.verify else
-                {"cert_reqs": 0},
-            )
-        except (websocket.WebSocketException, OSError) as exc:
-            raise JupyterError(str(exc), url=self.ws_url) from exc
-        # The handshake used client.timeout; the pump must block instead.
-        self._ws.settimeout(None)
-        self._closing = False
-        self._pump = threading.Thread(
-            target=self._pump_loop, name="jsonyter-pump-" + self.kernel_id[:8],
-            daemon=True)
-        self._pump.start()
+        # Double-checked: callers race here routinely (e.g. a subscribe and
+        # an execute arriving together). Without the lock both would open a
+        # socket, the second would overwrite the first, and a pump would be
+        # left reading an orphaned socket while sends went out on the other —
+        # replies would never be delivered and the call would hang.
+        with self._connect_lock:
+            if self.connected:
+                return self
+            headers = []
+            if self.client.token:
+                headers.append("Authorization: token " + self.client.token)
+            try:
+                ws = websocket.create_connection(
+                    self.ws_url, header=headers,
+                    timeout=self.client.timeout,
+                    sslopt=None if self.client._http.verify else
+                    {"cert_reqs": 0},
+                )
+            except (websocket.WebSocketException, OSError) as exc:
+                raise JupyterError(str(exc), url=self.ws_url) from exc
+            # The handshake used client.timeout; the pump must block instead.
+            ws.settimeout(None)
+            self._ws = ws
+            self._closing = False
+            self._dead = False
+            self._pump = threading.Thread(
+                target=self._pump_loop,
+                name="jsonyter-pump-" + self.kernel_id[:8], daemon=True)
+            self._pump.start()
         return self
 
     def close(self):
-        self._closing = True
-        ws, self._ws = self._ws, None
+        with self._connect_lock:
+            self._closing = True
+            ws, self._ws = self._ws, None
+            pump, self._pump = self._pump, None
         if ws is not None:
             try:
                 ws.close()
             except Exception:
                 pass
-        pump, self._pump = self._pump, None
         if pump is not None and pump is not threading.current_thread():
             pump.join(timeout=2.0)
         # Wake anything still waiting on a reply.
@@ -138,12 +151,21 @@ class KernelConnection:
         # kernel goes away, so shutdown_reply is the timely death signal.
         if msg_type == "status":
             state = content.get("execution_state")
-            self.execution_state = state
-            self._emit_event({"type": "status", "execution_state": state,
-                              "kernel_id": self.kernel_id})
+            # A dying kernel emits a final status (typically idle) *after*
+            # its shutdown_reply. Suppress it: once dead, staying dead is the
+            # only useful reading, and every consumer would otherwise have to
+            # rediscover this ordering trap and make `dead` sticky itself.
+            if not self._dead:
+                self.execution_state = state
+                self._emit_event({"type": "status", "execution_state": state,
+                                  "kernel_id": self.kernel_id})
         elif msg_type == "shutdown_reply":
+            restart = content.get("restart", False)
+            if not restart:
+                self._dead = True
+                self.execution_state = "dead"
             self._emit_event({"type": "dead", "kernel_id": self.kernel_id,
-                              "restart": content.get("restart", False)})
+                              "restart": restart})
 
         parent = msg.get("parent_header", {}).get("msg_id")
         with self._state_lock:
@@ -208,17 +230,17 @@ class KernelConnection:
         with self._state_lock:
             self._pending.pop(msg_id, None)
 
-    def _await(self, waiter, timeout):
+    def _await(self, waiter, timeout, setting="exec_timeout"):
         """Next message for a request, or raise on timeout/disconnect."""
         try:
             msg = waiter.get(timeout=timeout)
         except queue.Empty:
             raise JupyterError(
-                "timed out after {}s waiting for a kernel reply "
-                "(no message arrived in that window; pass a larger "
-                "timeout=, or timeout=None to wait indefinitely — some "
-                "kernels, e.g. SAS, are slow to respond on a fresh "
-                "connection)".format(timeout),
+                "timed out after {}s waiting for a kernel reply (no message "
+                "arrived in that window; pass a larger timeout=, raise "
+                "Client({}=...), or timeout=None to wait indefinitely — "
+                "some kernels are slow to respond, and some never answer "
+                "certain request types at all)".format(timeout, setting),
                 url=self.ws_url,
             ) from None
         if "__jsonyter_error__" in msg:
@@ -228,16 +250,24 @@ class KernelConnection:
     def _resolve_timeout(self, timeout):
         return timeout if timeout is not None else self.client.exec_timeout
 
+    def _resolve_control_timeout(self, timeout):
+        return timeout if timeout is not None else self.client.control_timeout
+
     def _request_reply(self, msg, timeout=None):
-        """Send ``msg`` and return the matching ``*_reply`` content."""
-        timeout = self._resolve_timeout(timeout)
+        """Send ``msg`` and return the matching ``*_reply`` content.
+
+        Used by the introspection calls, which are bounded by
+        ``control_timeout`` rather than ``exec_timeout`` — a kernel that never
+        answers one of them must not block the connection forever.
+        """
+        timeout = self._resolve_control_timeout(timeout)
         msg_id = msg["header"]["msg_id"]
         reply_type = msg["header"]["msg_type"].replace("_request", "_reply")
         waiter = self._register(msg_id)
         try:
             self._send(msg)
             while True:
-                received = self._await(waiter, timeout)
+                received = self._await(waiter, timeout, "control_timeout")
                 if received["header"]["msg_type"] == reply_type:
                     return received["content"]
         finally:
@@ -365,7 +395,18 @@ class KernelConnection:
 
     @prettifiable
     def is_complete(self, code, timeout=None):
-        """Whether ``code`` is complete input (drives REPL Enter behavior)."""
+        """Whether ``code`` is complete input (drives REPL Enter behavior).
+
+        Pass ``code`` as it would be *submitted* — i.e. newline-terminated —
+        not as the raw buffer text. Kernels disagree about trailing newlines
+        and several treat their absence as "more input coming": the SAS
+        kernel calls anything without a trailing newline ``incomplete``
+        (even an empty string), and CPython reports ``"def f():\\n    return
+        1"`` incomplete bare but complete once terminated. Genuinely
+        unfinished input still reports ``incomplete`` either way. This
+        library deliberately doesn't append the newline for you — it's a thin
+        protocol wrapper, and rewriting user code is the front end's call.
+        """
         return self._request_reply(
             messages.is_complete_request(self.session_id, code), timeout)
 

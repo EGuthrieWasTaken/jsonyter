@@ -101,12 +101,17 @@ conn.add_listener(lambda ev: print(ev))
 # {"type": "status", "execution_state": "idle", "kernel_id": "..."}
 # {"type": "dead", "kernel_id": "...", "restart": false}   <- kernel shut down
 # {"type": "disconnected", "message": "..."}               <- socket dropped
-conn.execution_state   # last seen state, or None
+conn.execution_state   # last seen state, "dead", or None
 ```
 
 A server often keeps the socket open for a moment after a kernel goes away, so
 `dead` (from the kernel's `shutdown_reply`) is the timely death signal;
 `disconnected` follows whenever the socket itself drops.
+
+`dead` is sticky. A dying kernel emits one last `status: idle` *after* its
+`shutdown_reply`, which would otherwise flip a naive state tracker back to
+"idle"; those trailing `status` events are suppressed and `execution_state`
+stays `"dead"`, so consumers don't each have to rediscover the ordering trap.
 
 Because the pump owns the socket, another thread may call
 `client.interrupt_kernel(kernel_id)` while `execute` is blocked — that's the
@@ -115,19 +120,25 @@ thread and must not block.
 
 ### Timeouts
 
-`Client` takes two independent timeouts:
+`Client` takes three independent timeouts:
 
 - `timeout` (default `10.0`s) bounds REST calls (`status`, `start_kernel`, ...)
   and the initial WebSocket handshake. Keep this short so a dead/unreachable
   server fails fast.
 - `exec_timeout` (default `None`) is the default wait for a kernel reply on
-  `execute`/`complete`/`inspect`/`is_complete`/`kernel_info`/`history`,
-  measured as *silence since the last message* — receiving any message,
-  including intermediate stream output, resets the clock, so it isn't a cap
-  on total run time. It defaults to waiting indefinitely, since a REPL
-  shouldn't impose an arbitrary deadline on someone's code, and some kernels
-  (e.g. SAS) can take a long time just to become responsive on a fresh
-  connection.
+  `execute`, measured as *silence since the last message* — receiving any
+  message, including intermediate stream output, resets the clock, so it
+  isn't a cap on total run time. It defaults to waiting indefinitely, since a
+  REPL shouldn't impose an arbitrary deadline on someone's code, and some
+  kernels (e.g. SAS) can take a long time just to become responsive on a
+  fresh connection.
+- `control_timeout` (default `30.0`s) is the same deadline for the
+  introspection calls — `complete`, `inspect`, `is_complete`, `kernel_info`,
+  `history`. These are bounded, interactive-latency operations, so unlike
+  `execute` they are **not** allowed to wait forever by default: kernels
+  exist that never answer some of them at all (the SAS kernel never replies
+  to `history_request`), and an unbounded wait there wedges the connection
+  permanently. Pass `None` to opt into waiting indefinitely anyway.
 
 ```python
 client = Client("https://jupyter.example.com", token="...", exec_timeout=120)
@@ -144,6 +155,18 @@ conn.execute(quick_code)              # falls back to client.exec_timeout
 If a kernel is genuinely stuck rather than just slow, reclaim it with
 `client.interrupt_kernel(kernel_id)` or `client.restart_kernel(kernel_id)`
 instead of guessing a timeout.
+
+### `is_complete` and trailing newlines
+
+Pass code to `is_complete` as it would be *submitted* — newline-terminated —
+rather than as raw buffer text. Kernels disagree about trailing newlines and
+several read their absence as "more input coming": the SAS kernel calls
+anything unterminated `incomplete` (even `""`), and CPython reports
+`"def f():\n    return 1"` incomplete bare but complete once terminated.
+Genuinely unfinished input still reports `incomplete` either way (verified on
+python3, ir, julia and sas). The library deliberately doesn't append the
+newline for you — it's a thin protocol wrapper, and rewriting user code is the
+front end's call.
 
 ## The JSON stdio bridge (for Emacs)
 

@@ -360,11 +360,19 @@ def main(argv=None):
                              "WebSocket handshake (not kernel execution)")
     parser.add_argument("--exec-timeout", type=float, default=None,
                         help="default timeout in seconds to wait for a "
-                             "kernel reply on execute/complete/inspect/etc, "
-                             "measured as silence since the last message "
-                             "(not total run time); omit for no timeout "
-                             "(wait indefinitely — the default, since some "
-                             "kernels such as SAS are slow to respond)")
+                             "kernel reply on execute, measured as silence "
+                             "since the last message (not total run time); "
+                             "omit for no timeout (wait indefinitely — the "
+                             "default, since user code may legitimately run "
+                             "for any length of time; use interrupt_kernel "
+                             "to stop it)")
+    parser.add_argument("--control-timeout", type=float, default=30.0,
+                        help="same, for the introspection calls (complete, "
+                             "inspect, is_complete, kernel_info, history), "
+                             "which are bounded operations; default 30. Pass "
+                             "0 to wait indefinitely — not advised, since a "
+                             "kernel that never answers one of these (SAS "
+                             "never answers history) would wedge its worker")
     parser.add_argument("--stream", action="store_true",
                         help="emit incremental {\"id\": N, \"output\": {...}} "
                              "lines for every execute, without each request "
@@ -378,6 +386,7 @@ def main(argv=None):
 
     client = Client(args.url, token=resolve_token(args) or False,
                     timeout=args.timeout, exec_timeout=args.exec_timeout,
+                    control_timeout=args.control_timeout or None,
                     verify_tls=not args.insecure)
     dispatcher = Dispatcher(client, pretty=args.pretty, stream=args.stream)
     try:

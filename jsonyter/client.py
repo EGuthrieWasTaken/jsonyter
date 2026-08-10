@@ -56,23 +56,32 @@ class Client:
     """
 
     def __init__(self, base_url="http://localhost:8888", token=None,
-                 timeout=10.0, exec_timeout=None, verify_tls=True):
+                 timeout=10.0, exec_timeout=None, control_timeout=30.0,
+                 verify_tls=True):
         """
         ``timeout`` bounds REST calls (``status``, ``start_kernel``, ...) and
         the initial WebSocket handshake — keep it short so a dead server
         fails fast.
 
         ``exec_timeout`` is the default wait for a kernel reply on
-        ``execute``/``complete``/``inspect``/etc: how long to wait with *no
-        message at all* from the kernel before giving up (each message
-        received, including intermediate output, resets the clock — it is
-        not a cap on total run time). Defaults to ``None``, meaning wait
-        indefinitely, since a REPL shouldn't impose an arbitrary deadline on
-        someone's code — some kernels (e.g. SAS) can also take a long time
-        just to become responsive on a fresh connection. Use
-        ``interrupt_kernel`` to reclaim a kernel that's actually stuck, or
-        pass a finite ``exec_timeout``/per-call ``timeout`` if you want calls
-        to give up on their own.
+        ``execute``: how long to wait with *no message at all* from the
+        kernel before giving up (each message received, including
+        intermediate output, resets the clock — it is not a cap on total run
+        time). Defaults to ``None``, meaning wait indefinitely, since a REPL
+        shouldn't impose an arbitrary deadline on someone's code — some
+        kernels (e.g. SAS) can also take a long time just to become
+        responsive on a fresh connection. Use ``interrupt_kernel`` to reclaim
+        a kernel that's actually stuck, or pass a finite ``exec_timeout``/
+        per-call ``timeout`` if you want executions to give up on their own.
+
+        ``control_timeout`` (default 30s) is the same kind of deadline for
+        the introspection calls — ``complete``, ``inspect``, ``is_complete``,
+        ``kernel_info`` and ``history``. Those are bounded,
+        interactive-latency operations, so unlike ``execute`` they must not
+        wait forever: kernels do exist that simply never answer some of them
+        (the SAS kernel never replies to ``history_request``), and an
+        unbounded wait there wedges the connection permanently. Pass ``None``
+        to opt into waiting indefinitely anyway.
 
         ``token`` falls back to the ``JUPYTER_TOKEN`` environment variable
         when not given, so it never has to be hardcoded in a script. Pass
@@ -86,6 +95,7 @@ class Client:
         self.token = token
         self.timeout = timeout
         self.exec_timeout = exec_timeout
+        self.control_timeout = control_timeout
         self._http = requests.Session()
         self._http.verify = verify_tls
         if token:
