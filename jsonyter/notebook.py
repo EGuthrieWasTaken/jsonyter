@@ -21,6 +21,7 @@ import uuid
 from .client import JupyterError
 
 CELL_TYPES = ("code", "markdown", "raw")
+OUTPUT_TYPES = ("stream", "display_data", "execute_result", "error")
 
 # Cell ids entered nbformat in 4.5; older notebooks must not carry them.
 _MINOR_WITH_IDS = 5
@@ -157,7 +158,54 @@ def _current_source(cell):
     return "".join(source) if isinstance(source, list) else source
 
 
-def _validate_specs(cells):
+def _normalize_outputs(outputs, index):
+    """Rebuild outputs through nbformat so each one is validated on its own.
+
+    Passing client dicts straight into the notebook would defer every problem
+    to the whole-notebook validate, where the error says far less about which
+    output was wrong.
+    """
+    nbformat = _nbformat()
+    if outputs is None:
+        return []
+    if not isinstance(outputs, list):
+        raise JupyterError(
+            "cells[{}].outputs must be a list, got {}".format(
+                index, type(outputs).__name__))
+    built = []
+    for position, output in enumerate(outputs):
+        if not isinstance(output, dict):
+            raise JupyterError(
+                "cells[{}].outputs[{}] must be an object, got {}".format(
+                    index, position, type(output).__name__))
+        output_type = output.get("output_type")
+        if output_type not in OUTPUT_TYPES:
+            raise JupyterError(
+                "cells[{}].outputs[{}] has invalid output_type {!r} "
+                "(expected one of {})".format(
+                    index, position, output_type, ", ".join(OUTPUT_TYPES)))
+        fields = {key: value for key, value in output.items()
+                  if key != "output_type"}
+        try:
+            built.append(nbformat.v4.new_output(output_type, **fields))
+        except Exception as exc:
+            raise JupyterError(
+                "cells[{}].outputs[{}] is not a valid {} output: {}".format(
+                    index, position, output_type, exc)) from exc
+    return built
+
+
+def _normalize_execution_count(value, index):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise JupyterError(
+            "cells[{}].execution_count must be a non-negative integer or "
+            "null, got {!r}".format(index, value))
+    return value
+
+
+def _validate_specs(cells, include_outputs=False):
     if not isinstance(cells, list):
         raise JupyterError("missing or invalid param: cells (expected a list)")
     specs = []
@@ -171,11 +219,18 @@ def _validate_specs(cells):
             raise JupyterError(
                 "cells[{}] has invalid cell_type {!r} (expected one of {})"
                 .format(index, cell_type, ", ".join(CELL_TYPES)))
-        specs.append({
+        parsed = {
             "id": spec.get("id"),
             "cell_type": cell_type,
             "source": _normalize_source(spec.get("source", "")),
-        })
+        }
+        # Outputs are read only when explicitly opted in, so the default path
+        # cannot be influenced by an `outputs` key the client happens to send.
+        if include_outputs and "outputs" in spec:
+            parsed["outputs"] = _normalize_outputs(spec["outputs"], index)
+            parsed["execution_count"] = _normalize_execution_count(
+                spec.get("execution_count"), index)
+        specs.append(parsed)
     return specs
 
 
@@ -207,7 +262,21 @@ def _new_cell(cell_type, source, with_id):
     return cell
 
 
-def _merge_cells(nb, specs):
+def _apply_outputs(cell, spec):
+    """Replace a code cell's outputs with the ones the client just produced.
+
+    Only ever called with ``include_outputs=True`` and only for specs that
+    carried an ``outputs`` key: a spec without one means "no opinion about
+    this cell", so whatever is stored survives. Non-code cells can't hold
+    outputs, so they're skipped (``_retype`` has already cleaned them).
+    """
+    if "outputs" not in spec or cell.get("cell_type") != "code":
+        return
+    cell["outputs"] = list(spec["outputs"])
+    cell["execution_count"] = spec.get("execution_count")
+
+
+def _merge_cells(nb, specs, include_outputs=False):
     """Rebuild ``nb.cells`` from ``specs``, preserving matched cells."""
     existing = list(nb.cells)
     with_ids = _supports_ids(nb) and any(cell.get("id") for cell in existing)
@@ -232,8 +301,11 @@ def _merge_cells(nb, specs):
             match = existing[index]
 
         if match is None:
-            merged.append(_new_cell(spec["cell_type"], spec["source"],
-                                    _supports_ids(nb)))
+            fresh = _new_cell(spec["cell_type"], spec["source"],
+                              _supports_ids(nb))
+            if include_outputs:
+                _apply_outputs(fresh, spec)
+            merged.append(fresh)
             continue
 
         consumed.add(id(match))
@@ -243,6 +315,8 @@ def _merge_cells(nb, specs):
         # stays byte-identical to the original file.
         if _current_source(match) != spec["source"]:
             match["source"] = spec["source"]
+        if include_outputs:
+            _apply_outputs(match, spec)
         merged.append(match)
 
     nb.cells = merged
@@ -290,8 +364,8 @@ def _atomic_write(nb, path):
                 pass
 
 
-def write_notebook(path, cells, expect_hash=None):
-    """Merge ``cells`` (source only) into the notebook at ``path``.
+def write_notebook(path, cells, expect_hash=None, include_outputs=False):
+    """Merge ``cells`` into the notebook at ``path``.
 
     ``cells`` is a list of ``{"id": ..., "cell_type": ..., "source": ...}``.
     The notebook on disk is read first and the cell list rebuilt in the given
@@ -309,8 +383,25 @@ def write_notebook(path, cells, expect_hash=None):
     preserved. Notebooks older than nbformat 4.5 have no cell ids, so cells
     are matched by position instead and no ids are written back.
 
-    Outputs are never written: the client doesn't send them and execution
-    results are session-only. Stored outputs are preserved, never updated.
+    Outputs are not written by default: execution results are session-only,
+    which keeps an ordinary save diff-sized and figure-free. Stored outputs
+    are preserved, never updated.
+
+    ``include_outputs=True`` opts into persisting freshly generated results
+    for this save only. Per-cell ``outputs`` and ``execution_count`` then
+    become meaningful:
+
+    - a spec carrying an ``outputs`` key (even ``[]``) *replaces* that cell's
+      stored outputs and ``execution_count`` — a fresh run replaces prior
+      output rather than appending, matching Jupyter's own semantics;
+    - a spec omitting ``outputs`` leaves the stored ones untouched, so a
+      client can send only the cells it actually re-ran;
+    - non-code cells never receive outputs, whatever the flag says.
+
+    Outputs are rebuilt through ``nbformat.v4.new_output``, so a malformed
+    one fails with :class:`JupyterError` before anything is written, exactly
+    like an invalid ``cell_type``. With ``include_outputs=False`` an
+    ``outputs`` key on a spec is ignored entirely.
 
     ``expect_hash`` is the sha256 the client last saw; if the file no longer
     matches, :class:`NotebookConflict` is raised and nothing is written. The
@@ -322,7 +413,7 @@ def write_notebook(path, cells, expect_hash=None):
     """
     nbformat = _nbformat()
     path = _resolve(path)
-    specs = _validate_specs(cells)
+    specs = _validate_specs(cells, include_outputs=include_outputs)
 
     if expect_hash is not None:
         actual = file_hash(path)
@@ -340,7 +431,7 @@ def write_notebook(path, cells, expect_hash=None):
         # Saving a notebook that doesn't exist yet creates it.
         nb = nbformat.v4.new_notebook()
 
-    _merge_cells(nb, specs)
+    _merge_cells(nb, specs, include_outputs=include_outputs)
 
     try:
         nbformat.validate(nb)

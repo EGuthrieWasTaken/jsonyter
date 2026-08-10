@@ -188,8 +188,9 @@ client.write_notebook("/path/nb.ipynb", [
 #  "written": True, "hash": "sha256..."}
 ```
 
-The client sends cell **source only**. `write_notebook` is a read-modify-write
-against the file on disk and rebuilds the cell list in the order given:
+The client sends cell **source** (and, opt-in, outputs — see below).
+`write_notebook` is a read-modify-write against the file on disk and rebuilds
+the cell list in the order given:
 
 - an `id` matching an existing cell **reuses that cell**, replacing only
   `source` — its `outputs`, `execution_count`, `metadata` and `attachments`
@@ -203,9 +204,41 @@ Notebook-level `metadata`, `nbformat` and `nbformat_minor` are preserved.
 Notebooks older than nbformat 4.5 have no cell ids, so cells are matched by
 position instead and no ids are written back.
 
-**Outputs are never written.** Execution results are session-only; stored
-outputs in the file are preserved but never updated. There is deliberately no
-output-writing path.
+**Outputs are not written by default.** Execution results are session-only, so
+an ordinary save stays diff-sized and figure-free; stored outputs in the file
+are preserved but never updated. An `outputs` key on a cell spec is ignored
+entirely unless you opt in.
+
+### Persisting outputs (`include_outputs`)
+
+Pass `include_outputs=True` to persist freshly generated results for that save
+only:
+
+```python
+client.write_notebook(path, [
+    {"id": "a1b2c3", "cell_type": "code", "source": "print(1)",
+     "execution_count": 3,
+     "outputs": [{"output_type": "stream", "name": "stdout", "text": "1\n"}]},
+    {"id": "d4e5f6", "cell_type": "markdown", "source": "# heading"},
+    {"id": "9z8y7x", "cell_type": "code", "source": "unrun cell"},
+], include_outputs=True)
+```
+
+- A spec carrying an `outputs` key (**even `[]`**) *replaces* that cell's
+  stored outputs and `execution_count` — a fresh run replaces prior output
+  rather than appending, matching Jupyter's own semantics. Above, `a1b2c3`
+  gets new outputs.
+- A spec **omitting** `outputs` leaves the stored ones untouched, so a client
+  can send only the cells it actually re-ran. Above, `9z8y7x` keeps whatever
+  is already on disk.
+- Non-code cells never receive outputs, whatever the flag says.
+
+Outputs use the four nbformat types — `stream` (`name`, `text`),
+`display_data`/`execute_result` (`data`, `metadata`, plus `execution_count`
+for `execute_result`), and `error` (`ename`, `evalue`, `traceback`) — and are
+rebuilt through `nbformat.v4.new_output`, so each is validated individually.
+A malformed one raises `JupyterError` before anything is written, exactly like
+an invalid `cell_type`.
 
 Writes go to a temp file in the same directory and are moved into place with
 `os.replace`, so an interrupted save can never truncate the original, and the

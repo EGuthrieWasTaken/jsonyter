@@ -224,10 +224,16 @@ class Client:
         return read_notebook(path)
 
     @prettifiable
-    def write_notebook(self, path, cells, expect_hash=None):
-        """Merge cell ``source`` into a local ``.ipynb``, preserving outputs."""
+    def write_notebook(self, path, cells, expect_hash=None,
+                       include_outputs=False):
+        """Merge cell ``source`` into a local ``.ipynb``, preserving outputs.
+
+        ``include_outputs=True`` also persists per-cell ``outputs``/
+        ``execution_count`` for this save; by default they are ignored.
+        """
         from .notebook import write_notebook
-        return write_notebook(path, cells, expect_hash=expect_hash)
+        return write_notebook(path, cells, expect_hash=expect_hash,
+                              include_outputs=include_outputs)
 
     @prettifiable
     def notebook_hash(self, path):

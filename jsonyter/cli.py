@@ -41,8 +41,9 @@ Available methods (params in parentheses):
 - ``subscribe``/``unsubscribe`` (``kernel_id``) — async kernel status events
 - ``disconnect`` (``kernel_id``) — close the websocket but leave the kernel up
 - ``read_notebook`` (``path``), ``write_notebook`` (``path``, ``cells``,
-  ``expect_hash``), ``notebook_hash`` (``path``) — local ``.ipynb`` files;
-  these need no server and no kernel, so the bridge is usable offline
+  ``expect_hash``, ``include_outputs``), ``notebook_hash`` (``path``) — local
+  ``.ipynb`` files; these need no server and no kernel, so the bridge is
+  usable offline
 """
 
 import argparse
@@ -71,7 +72,7 @@ _CLIENT_METHODS = {
     # Local filesystem, no server contact — and not on a kernel worker, so a
     # save never queues behind a running execute.
     "read_notebook": ("path",),
-    "write_notebook": ("path", "cells", "expect_hash"),
+    "write_notebook": ("path", "cells", "expect_hash", "include_outputs"),
     "notebook_hash": ("path",),
 }
 
