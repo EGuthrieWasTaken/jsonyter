@@ -1,5 +1,11 @@
 # jsonyter
 
+[![PyPI version](https://img.shields.io/pypi/v/jsonyter.svg)](https://pypi.org/project/jsonyter/)
+[![Downloads](https://img.shields.io/pypi/dm/jsonyter.svg)](https://pypistats.org/packages/jsonyter)
+[![Python versions](https://img.shields.io/pypi/pyversions/jsonyter.svg)](https://pypi.org/project/jsonyter/)
+[![Build and publish](https://github.com/EGuthrieWasTaken/jsonyter/actions/workflows/publish.yml/badge.svg)](https://github.com/EGuthrieWasTaken/jsonyter/actions/workflows/publish.yml)
+[![License: GPL-3.0-only](https://img.shields.io/pypi/l/jsonyter.svg)](https://github.com/EGuthrieWasTaken/jsonyter/blob/main/LICENSE)
+
 A JSON-first Python interface to a [Jupyter server](https://jupyter-server.readthedocs.io/).
 Every call makes web requests to a local or remote Jupyter server and returns
 plain Python objects (dicts/lists) that serialize directly with `json.dumps` —
