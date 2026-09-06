@@ -57,7 +57,7 @@ class Client:
 
     def __init__(self, base_url="http://localhost:8888", token=None,
                  timeout=10.0, exec_timeout=None, control_timeout=30.0,
-                 verify_tls=True):
+                 verify_tls=True, export_timeout=120.0):
         """
         ``timeout`` bounds REST calls (``status``, ``start_kernel``, ...) and
         the initial WebSocket handshake — keep it short so a dead server
@@ -83,6 +83,11 @@ class Client:
         unbounded wait there wedges the connection permanently. Pass ``None``
         to opt into waiting indefinitely anyway.
 
+        ``export_timeout`` (default 120s) bounds a single ``export_notebook``
+        request. A real notebook's PDF render is seconds-to-minutes, while
+        ``timeout`` exists to make a dead server fail fast — so export gets
+        its own, much larger, deadline.
+
         ``token`` falls back to the ``JUPYTER_TOKEN`` environment variable
         when not given, so it never has to be hardcoded in a script. Pass
         ``token=False`` for an explicitly unauthenticated server.
@@ -96,6 +101,7 @@ class Client:
         self.timeout = timeout
         self.exec_timeout = exec_timeout
         self.control_timeout = control_timeout
+        self.export_timeout = export_timeout
         self._http = requests.Session()
         self._http.verify = verify_tls
         if token:
@@ -121,6 +127,26 @@ class Client:
         if response.status_code == 204 or not response.content:
             return None
         return response.json()
+
+    def _request_raw(self, method, path, json_body=None, params=None, timeout=None):
+        """Like _request, but returns the raw requests.Response.
+
+        Redirects are NOT followed: /nbconvert is outside /api, so an
+        unauthenticated GET answers 302 -> /login -> 200 HTML, which would
+        otherwise be handed back as a successful export. Status codes are
+        not treated as errors here — the caller interprets them, since
+        status semantics differ from the JSON API.
+        """
+        url = self.base_url + path
+        try:
+            response = self._http.request(
+                method, url, json=json_body, params=params,
+                timeout=timeout if timeout is not None else self.timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            raise JupyterError(str(exc), url=url) from exc
+        return response
 
     def _get(self, path, params=None):
         return self._request("GET", path, params=params)
@@ -240,6 +266,26 @@ class Client:
         """sha256 of a local notebook, for the ``expect_hash`` staleness guard."""
         from .notebook import file_hash
         return {"path": path, "hash": file_hash(path)}
+
+    # ----------------------------------------------------------------- export
+
+    @prettifiable
+    def list_export_formats(self):
+        """Export formats this server offers, or why it offers none."""
+        from .export import list_export_formats
+        return list_export_formats(self)
+
+    @prettifiable
+    def export_notebook(self, format=None, *, server_path=None, cells=None,
+                        notebook=None, name=None, to_path=None,
+                        include_outputs=None, sanitize_html=None, timeout=None):
+        """Export a notebook through the server's nbconvert endpoint."""
+        from .export import export_notebook
+        return export_notebook(
+            self, format, server_path=server_path, cells=cells,
+            notebook=notebook, name=name, to_path=to_path,
+            include_outputs=include_outputs, sanitize_html=sanitize_html,
+            timeout=timeout)
 
     # --------------------------------------------------------------- kernels'
     # websocket connections

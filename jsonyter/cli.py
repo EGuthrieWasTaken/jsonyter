@@ -44,6 +44,11 @@ Available methods (params in parentheses):
   ``expect_hash``, ``include_outputs``), ``notebook_hash`` (``path``) — local
   ``.ipynb`` files; these need no server and no kernel, so the bridge is
   usable offline
+- ``list_export_formats`` (), ``export_notebook`` (``format``,
+  ``server_path``, ``cells``, ``notebook``, ``name``, ``to_path``,
+  ``include_outputs``, ``sanitize_html``, ``timeout``) — nbconvert export via
+  the server; both run on the REST pool, never a kernel worker, so a long
+  export cannot queue behind a running ``execute``
 """
 
 import argparse
@@ -74,6 +79,9 @@ _CLIENT_METHODS = {
     "read_notebook": ("path",),
     "write_notebook": ("path", "cells", "expect_hash", "include_outputs"),
     "notebook_hash": ("path",),
+    "list_export_formats": (),
+    "export_notebook": ("format", "server_path", "cells", "notebook", "name",
+                        "to_path", "include_outputs", "sanitize_html", "timeout"),
 }
 
 _KERNEL_METHODS = {
@@ -166,6 +174,9 @@ class Dispatcher:
             self._run(request)
 
     def _start_rest_workers(self, count=4):
+        # A long export occupies one of these workers for its whole
+        # duration; that's acceptable and sizing the pool for it is out of
+        # scope, so this count is left alone.
         for i in range(count):
             thread = threading.Thread(
                 target=self._rest_worker_loop,
@@ -404,6 +415,11 @@ def main(argv=None):
                         help="emit incremental {\"id\": N, \"output\": {...}} "
                              "lines for every execute, without each request "
                              "having to ask for \"stream\": true")
+    parser.add_argument("--export-timeout", type=float, default=120.0,
+                        help="default per-export deadline in seconds "
+                             "(export_notebook); a PDF render is "
+                             "seconds-to-minutes, so this is deliberately "
+                             "much larger than --timeout")
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS certificate verification")
     parser.add_argument("--pretty", action="store_true",
@@ -414,7 +430,8 @@ def main(argv=None):
     client = Client(args.url, token=resolve_token(args) or False,
                     timeout=args.timeout, exec_timeout=args.exec_timeout,
                     control_timeout=args.control_timeout or None,
-                    verify_tls=not args.insecure)
+                    verify_tls=not args.insecure,
+                    export_timeout=args.export_timeout)
     dispatcher = Dispatcher(client, pretty=args.pretty, stream=args.stream)
     try:
         dispatcher.run()
