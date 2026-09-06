@@ -171,6 +171,10 @@ thread and must not block.
   exist that never answer some of them at all (the SAS kernel never replies
   to `history_request`), and an unbounded wait there wedges the connection
   permanently. Pass `None` to opt into waiting indefinitely anyway.
+- `export_timeout` (default `120.0`s) bounds a single `export_notebook`
+  request. A real notebook's PDF render is seconds-to-minutes, while
+  `timeout` exists to make a dead server fail fast — export gets its own,
+  much larger, deadline.
 
 ```python
 client = Client("https://jupyter.example.com", token="...", exec_timeout=120)
@@ -287,6 +291,173 @@ id guaranteed on every cell — its job is older notebooks (nbformat 3, or
 itself is not modified. A `write_notebook` to a path that doesn't exist yet
 creates the notebook.
 
+## Exporting notebooks
+
+`list_export_formats()` and `export_notebook()` wrap the Jupyter server's
+nbconvert endpoints — jsonyter never runs nbconvert itself, so every format
+the target server offers is supported, including third-party exporters
+registered by entry point:
+
+```python
+client.list_export_formats()
+# {"available": true,
+#  "formats": {"html": {"output_mimetype": "text/html"}, "markdown": {...}, ...},
+#  "reason": null}
+```
+
+`available: false` (with a `reason`) means the server doesn't serve
+nbconvert at all — nbconvert isn't installed, or a downstream server app has
+disabled the endpoints — rather than raising, since this is meant as a
+capability probe.
+
+Export has two modes, picked by which of `server_path`/`cells`/`notebook`
+you pass (exactly one is required):
+
+```python
+# GET: export a notebook already saved server-side, as it is stored on disk
+client.export_notebook("html", server_path="analysis.ipynb")
+
+# POST: export in-memory buffer state — no file needs to exist on the server
+client.export_notebook("markdown", cells=[
+    {"cell_type": "code", "source": "print('hi')"},
+])
+
+# POST: export an existing nbformat dict (read_notebook, or a raw .ipynb load)
+nb = client.read_notebook("analysis.ipynb")
+client.export_notebook("markdown", notebook=nb)
+```
+
+Use `server_path` for a file already on the server; use `cells`/`notebook`
+for a REPL front end's unsaved buffer, or a remote server the client can't
+write to.
+
+**This is where `write_notebook`'s outputs-off default bites.** Export
+renders only the outputs already present in the notebook it's handed — a GET
+export of a file saved through `write_notebook`'s default has *no results in
+it*, since outputs are session-only and never written unless you pass
+`include_outputs=True` to `write_notebook`. To export "what I just ran"
+without changing your save semantics, use `cells=`/`notebook=` (POST mode),
+where `export_notebook`'s own `include_outputs` defaults to `True` —
+deliberately the opposite of `write_notebook`, since an export with no
+results in it is nearly useless:
+
+```python
+# POST mode defaults to including outputs already on the cells
+client.export_notebook("html", cells=[
+    {"cell_type": "code", "source": "1 + 1",
+     "execution_count": 1,
+     "outputs": [{"output_type": "execute_result",
+                  "data": {"text/plain": "2"}, "metadata": {},
+                  "execution_count": 1}]},
+])
+client.export_notebook("html", cells=[...], include_outputs=False)  # opt out
+```
+
+`include_outputs` only applies to `cells`/`notebook`; `server_path` always
+exports the file exactly as stored. `sanitize_html` is GET-only (it's a
+server option `server_path` alone can use).
+
+**A format's mimetype can lie.** `webpdf`, `qtpdf` and `qtpng` are reported
+as `text/html` by the server (inherited from the HTML exporter they build
+on) even though they emit PDF/PNG bytes; `export_notebook` already knows
+this and encodes them as base64 regardless of the advertised type.
+
+**Some exports come back as a bundle** — markdown with an image output, for
+example, comes back as a zip of the document plus sidecar files. jsonyter
+always unpacks it; you never receive a zip:
+
+```python
+client.export_notebook("markdown", server_path="withimage.ipynb")
+# {"format": "markdown", "mimetype": "text/markdown", "extension": ".md",
+#  "encoding": "text", "content": "...![png](output_0_0.png)\n",
+#  "bundle": true,
+#  "resources": [{"name": "output_0_0.png", "mimetype": "image/png",
+#                 "encoding": "base64", "content": "iVBORw0KG..."}]}
+```
+
+`resources` entries are keyed by the basename the primary document already
+references them by, so writing them alongside it (see `to_path` below) makes
+the document work as-is. A non-bundle response looks the same shape minus
+the resources:
+
+```python
+client.export_notebook("pdf", server_path="analysis.ipynb")
+# {"format": "pdf", "mimetype": "application/pdf", "extension": ".pdf",
+#  "encoding": "base64", "content": "JVBERi0xLjUK...", "bundle": false,
+#  "resources": []}
+```
+
+`encoding` is `"text"` or `"base64"` depending on whether the bytes decode as
+UTF-8 (binary formats are always base64, regardless).
+
+Pass `to_path` to write the result to disk instead of returning it inline —
+resources are always written alongside the primary file, under their own
+basenames, overwriting same-named files:
+
+```python
+client.export_notebook("markdown", server_path="withimage.ipynb",
+                       to_path="/tmp/out/analysis.md")
+# {"format": "markdown", "mimetype": "text/markdown", "extension": ".md",
+#  "path": "/tmp/out/analysis.md", "bytes": 51, "sha256": "...",
+#  "bundle": true,
+#  "resources": [{"name": "output_0_0.png", "path": "/tmp/out/output_0_0.png",
+#                 "bytes": 74, "sha256": "..."}]}
+```
+
+If `to_path` names an existing directory (or ends in a path separator), the
+filename is derived from `name`/`server_path` instead. Writes go to a temp
+file in the destination directory and are moved into place with
+`os.replace`, same as `write_notebook`, so an interrupted export can't
+truncate an existing file.
+
+A failed export raises `ExportError` (a `JupyterError`) with the server's
+own message recovered from its HTML error page — never the page itself:
+
+```python
+from jsonyter import ExportError
+try:
+    client.export_notebook("pdf", server_path="analysis.ipynb")
+except ExportError as err:
+    err.message             # "Pandoc wasn't found. ..."
+    err.hint                 # "the 'pdf' exporter needs pandoc and a LaTeX ..."
+    err.available_formats    # populated only for "unknown export format" errors
+```
+
+See the [server-side toolchain requirements](#server-side-toolchain-for-pdf-exports)
+below if `pdf`/`latex`/`webpdf` fail — those exporters need packages
+installed on the **Jupyter server**, not in jsonyter.
+
+### Server-side toolchain for PDF exports
+
+nbconvert runs server-side, so `pdf`/`latex`/`webpdf` need packages on the
+**Jupyter server's** image, not in jsonyter:
+
+```dockerfile
+# pdf / latex: pandoc + a LaTeX engine
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pandoc texlive-xetex texlive-fonts-recommended texlive-plain-generic \
+    && rm -rf /var/lib/apt/lists/*
+# add `inkscape` too if notebooks produce SVG outputs
+
+# webpdf: headless Chromium via playwright, no LaTeX needed
+RUN pip install --no-cache-dir "nbconvert[webpdf]" \
+    && playwright install --with-deps chromium
+```
+
+Without pandoc, `pdf`/`latex` fail with `Pandoc wasn't found` (`export_notebook`
+raises this as `ExportError.message`, with a `hint` naming the fix). CJK and
+emoji glyphs render as tofu with the package set above — the LaTeX engine
+also needs to be told to use a CJK-capable font (`fonts-noto-cjk` alone isn't
+enough); treat that as a separate font-configuration task.
+
+For `webpdf` in a container running as root, Chromium's sandbox needs to be
+disabled server-side (`c.WebPDFExporter.disable_sandbox = True` in
+`jupyter_server_config.py`); a browser launch failure of any kind — sandbox
+refusal included — is reported by nbconvert as the same misleading "no
+suitable chromium executable found" message, so if that appears after
+`playwright install chromium` has already run, check for a
+playwright/Chromium version mismatch before chasing anything else.
+
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
@@ -397,6 +568,7 @@ either.
 | Sessions | `list_sessions`, `create_session`, `get_session`, `delete_session` |
 | Contents | `get_contents` |
 | Notebooks (local files) | `read_notebook`, `write_notebook`, `notebook_hash` |
+| Export | `list_export_formats`, `export_notebook` |
 | Kernel (WebSocket) | `execute`, `complete`, `inspect`, `is_complete`, `kernel_info`, `history` |
 | Events | `add_listener`/`remove_listener` (library), `subscribe`/`unsubscribe` (bridge) |
 
