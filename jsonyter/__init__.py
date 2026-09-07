@@ -13,7 +13,7 @@ from .notebook import NotebookConflict, file_hash, read_notebook, write_notebook
 from .transfer import (DEFAULT_CHUNK_SIZE, MAX_SAFE_CHUNK_SIZE, TransferConflict,
                        download, kernel_contents_dir, upload)
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 __all__ = ["Client", "KernelConnection", "JupyterError", "NotebookConflict",
            "ExportError", "TransferConflict", "read_notebook", "write_notebook",

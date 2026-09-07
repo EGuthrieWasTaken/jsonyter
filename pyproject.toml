@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "jsonyter"
-version = "1.2.0"
+version = "2.0.0"
 description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
 readme = "README.md"
 requires-python = ">=3.9"
