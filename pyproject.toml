@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "jsonyter"
-version = "1.1.0"
+version = "1.2.0"
 description = "JSON-first Python interface to a Jupyter server, suitable for driving a REPL from Emacs or any other editor."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,6 +44,9 @@ Issues = "https://github.com/EGuthrieWasTaken/jsonyter/issues"
 
 [project.scripts]
 jsonyter = "jsonyter.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=7"]
 
 [tool.uv.build-backend]
 module-root = ""

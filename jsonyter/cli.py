@@ -27,6 +27,11 @@ Lines that are not final responses are tagged by an extra key instead of
   works when only one request is waiting).
 - ``{"event": {...}, "kernel_id": ...}`` — async kernel state, after
   ``subscribe``.
+- ``{"id": N, "progress": {...}}`` — transfer progress from a running
+  ``upload``/``download``: ``{"phase", "path", "local_path", "bytes_done",
+  "bytes_total", "chunk", "chunks_total", "elapsed"}``. Rate-limited to
+  ~4/second; the last one before the ``result`` always has
+  ``bytes_done == bytes_total``.
 
 Available methods (params in parentheses):
 
@@ -49,6 +54,17 @@ Available methods (params in parentheses):
   ``include_outputs``, ``sanitize_html``, ``timeout``) — nbconvert export via
   the server; both run on the REST pool, never a kernel worker, so a long
   export cannot queue behind a running ``execute``
+- ``get_contents`` (``path``, ``content``, ``type``, ``format``, ``hash``),
+  ``put_contents`` (``path``, ``content``, ``type``, ``format``, ``chunk``),
+  ``make_directory`` (``path``), ``delete_contents`` (``path``),
+  ``rename_contents`` (``path``, ``new_path``), ``copy_contents`` (``path``,
+  ``to_dir``), ``list_contents`` (``path``) — the Jupyter Contents API
+- ``upload`` (``local_path``, ``remote_path``, ``chunk_size``, ``overwrite``,
+  ``expect_hash``, ``resume``), ``download`` (``remote_path``, ``local_path``,
+  ``overwrite``, ``expect_hash``, ``resume``), ``kernel_contents_dir``
+  (``kernel_id``, ``root``) — chunked single-file transfer, on the REST pool
+  so a big transfer never queues behind a running ``execute``; ``upload``/
+  ``download`` emit ``progress`` lines while running
 """
 
 import argparse
@@ -59,6 +75,7 @@ import sys
 import threading
 import time
 
+from . import transfer
 from .client import Client, JupyterError
 
 # Client methods invocable directly, mapped to accepted params.
@@ -73,7 +90,21 @@ _CLIENT_METHODS = {
     "create_session": ("path", "kernel_name", "session_type", "name"),
     "get_session": ("session_id",),
     "delete_session": ("session_id",),
-    "get_contents": ("path", "content"),
+    # Jupyter Contents API. upload/download/kernel_contents_dir are not Client
+    # methods — they are dispatched to jsonyter.transfer below — but ride the
+    # same REST pool so a 400 MB upload never queues behind a running execute.
+    "get_contents": ("path", "content", "type", "format", "hash"),
+    "put_contents": ("path", "content", "type", "format", "chunk"),
+    "make_directory": ("path",),
+    "delete_contents": ("path",),
+    "rename_contents": ("path", "new_path"),
+    "copy_contents": ("path", "to_dir"),
+    "list_contents": ("path",),
+    "upload": ("local_path", "remote_path", "chunk_size", "overwrite",
+               "expect_hash", "resume"),
+    "download": ("remote_path", "local_path", "overwrite", "expect_hash",
+                 "resume"),
+    "kernel_contents_dir": ("kernel_id", "root"),
     # Local filesystem, no server contact — and not on a kernel worker, so a
     # save never queues behind a running execute.
     "read_notebook": ("path",),
@@ -100,13 +131,14 @@ class Dispatcher:
     """Routes JSON requests to the client/kernels, concurrently."""
 
     def __init__(self, client, stdin=None, stdout=None, pretty=False,
-                 stream=False):
+                 stream=False, chunk_size=None):
         self.client = client
         self.connections = {}
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
         self.pretty = pretty
         self.stream = stream
+        self.default_chunk_size = chunk_size or transfer.DEFAULT_CHUNK_SIZE
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._workers = {}          # kernel_id -> (Queue, Thread)
@@ -114,6 +146,7 @@ class Dispatcher:
         self._rest_queue = queue.Queue()
         self._pending_input = {}    # request id -> Queue
         self._subscribed = {}       # kernel_id -> listener callable
+        self._contents_dir_cache = {}   # kernel_id -> kernel_contents_dir result
         self._stopping = False
 
     # ----------------------------------------------------------------- output
@@ -222,6 +255,54 @@ class Dispatcher:
         if answer is not None:
             answer.put(value)
 
+    # --------------------------------------------------------------- transfer
+
+    def _progress_emitter(self, request_id, min_interval=0.25):
+        """A ``progress`` callable for one transfer.
+
+        Emits ``{"id": N, "progress": {...}}`` lines at most ~4/second so a
+        fast local transfer of a small-chunked file can't flood the pipe, but
+        never drops the final event (``bytes_done == bytes_total``).
+        """
+        state = {"last": 0.0}
+
+        def emit(event):
+            total = event.get("bytes_total")
+            final = total is not None and event.get("bytes_done") == total
+            now = time.monotonic()
+            if final or now - state["last"] >= min_interval:
+                state["last"] = now
+                self._emit({"id": request_id, "progress": event})
+
+        return emit
+
+    def _run_transfer(self, method, request_id, kwargs):
+        if method == "upload":
+            kwargs.setdefault("chunk_size", self.default_chunk_size)
+            fn = transfer.upload
+        else:
+            fn = transfer.download
+        return fn(self.client, progress=self._progress_emitter(request_id),
+                  **kwargs)
+
+    def _kernel_contents_dir(self, kwargs):
+        kernel_id = kwargs.get("kernel_id")
+        if not kernel_id:
+            raise JupyterError("missing required param: kernel_id")
+        root = kwargs.get("root")
+        if root is None:
+            cached = self._contents_dir_cache.get(kernel_id)
+            if cached is not None:
+                return dict(cached, cached=True)
+        conn = self._connection(kernel_id)
+        result = transfer.kernel_contents_dir(self.client, kernel_id, root=root,
+                                              conn=conn)
+        result["cached"] = False
+        if (root is None and result.get("method") == "probe"
+                and result.get("contents_dir") is not None):
+            self._contents_dir_cache[kernel_id] = result
+        return result
+
     # -------------------------------------------------------------- dispatch
 
     def dispatch(self, request):
@@ -232,14 +313,21 @@ class Dispatcher:
         if method in _CLIENT_METHODS:
             allowed = _CLIENT_METHODS[method]
             kwargs = {k: v for k, v in params.items() if k in allowed}
-            args = []
-            if "kernel_id" in kwargs:
-                args = [kwargs.pop("kernel_id")]
-            if "session_id" in kwargs:
-                args = [kwargs.pop("session_id")]
-            if method == "shutdown_kernel" and args:
-                self._drop_connection(args[0])
-            result = getattr(self.client, method)(*args, **kwargs)
+            if method in ("upload", "download"):
+                result = self._run_transfer(method, request_id, kwargs)
+            elif method == "kernel_contents_dir":
+                result = self._kernel_contents_dir(kwargs)
+            else:
+                args = []
+                if "kernel_id" in kwargs:
+                    args = [kwargs.pop("kernel_id")]
+                if "session_id" in kwargs:
+                    args = [kwargs.pop("session_id")]
+                if method in ("shutdown_kernel", "restart_kernel") and args:
+                    self._contents_dir_cache.pop(args[0], None)
+                if method == "shutdown_kernel" and args:
+                    self._drop_connection(args[0])
+                result = getattr(self.client, method)(*args, **kwargs)
         elif method in _KERNEL_METHODS:
             kernel_id = params.get("kernel_id")
             if not kernel_id:
@@ -420,6 +508,19 @@ def main(argv=None):
                              "(export_notebook); a PDF render is "
                              "seconds-to-minutes, so this is deliberately "
                              "much larger than --timeout")
+    parser.add_argument("--transfer-timeout", type=float, default=300.0,
+                        help="per-request deadline in seconds for upload/"
+                             "download chunks and the server-side hash "
+                             "(default 300); a single chunk over a slow "
+                             "uplink, or hashing a multi-GB file, can outlast "
+                             "--timeout by a lot")
+    parser.add_argument("--chunk-size", type=int, default=None, metavar="BYTES",
+                        help="raw bytes per upload chunk (default 8 MiB). "
+                             "Uploads are chunked because gateways such as "
+                             "Cloudflare cap the request body at 100 MB by "
+                             "default and a base64 body is 4/3 the raw size, "
+                             "so the safe ceiling is ~74 MB; raise this only "
+                             "if your deployment allows a larger body")
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS certificate verification")
     parser.add_argument("--pretty", action="store_true",
@@ -427,12 +528,22 @@ def main(argv=None):
                              "one-line-per-response protocol editors rely on)")
     args = parser.parse_args(argv)
 
+    if (args.chunk_size is not None
+            and args.chunk_size > transfer.MAX_SAFE_CHUNK_SIZE):
+        parser.error(
+            "--chunk-size {} exceeds the safe maximum of {} bytes (~74 MB): a "
+            "base64 request body is 4/3 the raw chunk, and Cloudflare rejects "
+            "bodies over 100 MB by default".format(
+                args.chunk_size, transfer.MAX_SAFE_CHUNK_SIZE))
+
     client = Client(args.url, token=resolve_token(args) or False,
                     timeout=args.timeout, exec_timeout=args.exec_timeout,
                     control_timeout=args.control_timeout or None,
                     verify_tls=not args.insecure,
-                    export_timeout=args.export_timeout)
-    dispatcher = Dispatcher(client, pretty=args.pretty, stream=args.stream)
+                    export_timeout=args.export_timeout,
+                    transfer_timeout=args.transfer_timeout)
+    dispatcher = Dispatcher(client, pretty=args.pretty, stream=args.stream,
+                            chunk_size=args.chunk_size)
     try:
         dispatcher.run()
     except KeyboardInterrupt:

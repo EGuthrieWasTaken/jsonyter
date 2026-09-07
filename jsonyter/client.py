@@ -12,6 +12,13 @@ import os
 
 import requests
 
+# Statuses a gateway like Cloudflare emits on its own behalf. A response with
+# one of these *plus* a ``cf-ray`` header and ``server: cloudflare`` is the
+# proxy talking, not the Jupyter server — a different set of knobs fixes it,
+# so the error message has to say which layer refused.
+_PROXY_STATUS = frozenset({413, 429, 502, 503, 504, 520, 521, 522, 523, 524,
+                           525, 526, 530})
+
 
 def prettifiable(method):
     """Give ``method`` a ``pretty`` keyword (default False).
@@ -31,19 +38,25 @@ def prettifiable(method):
 class JupyterError(Exception):
     """Error talking to the Jupyter server, renderable as JSON."""
 
-    def __init__(self, message, status=None, url=None):
+    def __init__(self, message, status=None, url=None, cf_ray=None):
         super().__init__(message)
         self.message = message
         self.status = status
         self.url = url
+        # Set only when the failing response carried a ``cf-ray`` header, so a
+        # front end can tell "the proxy refused" from "the server refused".
+        self.cf_ray = cf_ray
 
     def to_json(self):
-        return {
+        payload = {
             "error": type(self).__name__,
             "message": self.message,
             "status": self.status,
             "url": self.url,
         }
+        if self.cf_ray:
+            payload["cf_ray"] = self.cf_ray
+        return payload
 
 
 class Client:
@@ -57,7 +70,7 @@ class Client:
 
     def __init__(self, base_url="http://localhost:8888", token=None,
                  timeout=10.0, exec_timeout=None, control_timeout=30.0,
-                 verify_tls=True, export_timeout=120.0):
+                 verify_tls=True, export_timeout=120.0, transfer_timeout=300.0):
         """
         ``timeout`` bounds REST calls (``status``, ``start_kernel``, ...) and
         the initial WebSocket handshake — keep it short so a dead server
@@ -88,6 +101,13 @@ class Client:
         ``timeout`` exists to make a dead server fail fast — so export gets
         its own, much larger, deadline.
 
+        ``transfer_timeout`` (default 300s) is the per-request deadline for
+        the chunked file-transfer calls (``put_contents``/``get_contents``
+        while an ``upload``/``download`` is running, and the ranged
+        ``/files/`` reads). One 8 MiB chunk over a slow uplink, or hashing a
+        multi-GB file server-side, routinely outlasts ``timeout``; a whole
+        transfer is still unbounded, only each request is capped.
+
         ``token`` falls back to the ``JUPYTER_TOKEN`` environment variable
         when not given, so it never has to be hardcoded in a script. Pass
         ``token=False`` for an explicitly unauthenticated server.
@@ -102,6 +122,7 @@ class Client:
         self.exec_timeout = exec_timeout
         self.control_timeout = control_timeout
         self.export_timeout = export_timeout
+        self.transfer_timeout = transfer_timeout
         self._http = requests.Session()
         self._http.verify = verify_tls
         if token:
@@ -109,21 +130,30 @@ class Client:
 
     # ------------------------------------------------------------------ core
 
-    def _request(self, method, path, json_body=None, params=None):
+    def _request(self, method, path, json_body=None, params=None, timeout=None):
         url = self.base_url + path
         try:
             response = self._http.request(
                 method, url, json=json_body, params=params,
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
             )
         except requests.RequestException as exc:
             raise JupyterError(str(exc), url=url) from exc
         if response.status_code >= 400:
+            cf_ray = response.headers.get("cf-ray")
             try:
                 detail = response.json().get("message", response.text)
             except ValueError:
                 detail = response.text
-            raise JupyterError(detail, status=response.status_code, url=url)
+            if (cf_ray and response.status_code in _PROXY_STATUS
+                    and "cloudflare" in response.headers.get(
+                        "server", "").lower()):
+                detail = ("{} — HTTP {} from the proxy (cf-ray {} present), "
+                          "not from the Jupyter server".format(
+                              (detail or "").strip() or response.reason,
+                              response.status_code, cf_ray))
+            raise JupyterError(detail, status=response.status_code, url=url,
+                               cf_ray=cf_ray)
         if response.status_code == 204 or not response.content:
             return None
         return response.json()
@@ -148,14 +178,20 @@ class Client:
             raise JupyterError(str(exc), url=url) from exc
         return response
 
-    def _get(self, path, params=None):
-        return self._request("GET", path, params=params)
+    def _get(self, path, params=None, timeout=None):
+        return self._request("GET", path, params=params, timeout=timeout)
 
-    def _post(self, path, json_body=None):
-        return self._request("POST", path, json_body=json_body)
+    def _post(self, path, json_body=None, timeout=None):
+        return self._request("POST", path, json_body=json_body, timeout=timeout)
 
-    def _delete(self, path):
-        return self._request("DELETE", path)
+    def _put(self, path, json_body=None, timeout=None):
+        return self._request("PUT", path, json_body=json_body, timeout=timeout)
+
+    def _patch(self, path, json_body=None, timeout=None):
+        return self._request("PATCH", path, json_body=json_body, timeout=timeout)
+
+    def _delete(self, path, timeout=None):
+        return self._request("DELETE", path, timeout=timeout)
 
     # ---------------------------------------------------------------- server
 
@@ -233,12 +269,99 @@ class Client:
         return {"id": session_id, "deleted": True}
 
     # -------------------------------------------------------------- contents
+    # Thin wrappers over the Jupyter Contents API. The chunked file-transfer
+    # orchestration (upload/download/kernel_contents_dir) lives in
+    # ``jsonyter.transfer`` and drives these.
 
     @prettifiable
-    def get_contents(self, path="", content=True):
-        """File/notebook contents at ``path`` (notebooks come back as JSON)."""
+    def get_contents(self, path="", content=True, type=None, format=None,
+                     hash=False, timeout=None):
+        """``GET /api/contents/<path>`` — a file / notebook / directory model.
+
+        ``content=False`` returns metadata only (``size``, ``last_modified``,
+        ``type``, ...), which keeps a whole-file read off the wire.
+        ``format="base64"`` forces byte-exact retrieval of a file that would
+        otherwise be decoded as text. ``hash=True`` adds ``hash`` and
+        ``hash_algorithm`` (sha256) to the model on jupyter_server >= 2.11
+        and composes with ``content=False`` — the server re-reads the bytes
+        to hash them, so the digest itself costs no download. Servers older
+        than 2.11 ignore the argument and return no ``hash`` key.
+        """
         params = {"content": "1" if content else "0"}
-        return self._get("/api/contents/" + path.lstrip("/"), params=params)
+        if type is not None:
+            params["type"] = type
+        if format is not None:
+            params["format"] = format
+        if hash:
+            params["hash"] = "1"
+        return self._get("/api/contents/" + path.lstrip("/"), params=params,
+                         timeout=timeout)
+
+    @prettifiable
+    def put_contents(self, path, content, type="file", format="base64",
+                     chunk=None, timeout=None):
+        """``PUT /api/contents/<path>`` — create or overwrite.
+
+        ``chunk`` drives the large-file protocol of ``AsyncLargeFileManager``
+        (the default contents manager): ``1`` creates / truncates, ``2..n``
+        append, and ``-1`` appends the final piece and runs post-save hooks.
+        Only ``type="file"`` is chunkable server-side. A lone ``chunk=1`` with
+        no ``-1`` to follow never runs the hooks, so a file that fits in one
+        chunk should be sent with ``chunk=None`` (a plain save).
+        """
+        model = {"type": type, "format": format, "content": content}
+        if chunk is not None:
+            model["chunk"] = chunk
+        return self._put("/api/contents/" + path.lstrip("/"), model,
+                         timeout=timeout)
+
+    @prettifiable
+    def make_directory(self, path, timeout=None):
+        """``PUT /api/contents/<path>`` with ``{"type": "directory"}``.
+
+        Names the directory exactly, unlike ``POST`` (which creates an
+        "Untitled Folder").
+        """
+        return self._put("/api/contents/" + path.lstrip("/"),
+                         {"type": "directory"}, timeout=timeout)
+
+    @prettifiable
+    def delete_contents(self, path, timeout=None):
+        """``DELETE /api/contents/<path>``."""
+        self._delete("/api/contents/" + path.lstrip("/"), timeout=timeout)
+        return {"path": path.strip("/"), "deleted": True}
+
+    @prettifiable
+    def rename_contents(self, path, new_path, timeout=None):
+        """``PATCH /api/contents/<path>`` with ``{"path": new_path}``.
+
+        The URL carries the *old* path, the body the *new* one. Moves and
+        renames are the same operation.
+        """
+        return self._patch("/api/contents/" + path.lstrip("/"),
+                           {"path": new_path.lstrip("/")}, timeout=timeout)
+
+    @prettifiable
+    def copy_contents(self, path, to_dir, timeout=None):
+        """``POST /api/contents/<to_dir>`` with ``{"copy_from": path}``.
+
+        A server-side copy — no bytes cross the wire. The server picks the
+        destination *name* (appending "-Copy1" and so on); read it back from
+        the returned model rather than assuming it.
+        """
+        return self._post("/api/contents/" + to_dir.lstrip("/"),
+                          {"copy_from": path.lstrip("/")}, timeout=timeout)
+
+    @prettifiable
+    def list_contents(self, path="", timeout=None):
+        """Directory listing — ``get_contents`` on a directory.
+
+        Children arrive under ``content`` without their own ``content`` but
+        with ``name`` / ``path`` / ``type`` / ``size`` / ``last_modified`` /
+        ``writable``.
+        """
+        return self._get("/api/contents/" + path.lstrip("/"),
+                         params={"content": "1"}, timeout=timeout)
 
     # ------------------------------------------------------- local notebooks
     # Filesystem operations: no server contact, so they work offline.
