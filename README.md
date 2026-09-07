@@ -458,6 +458,126 @@ suitable chromium executable found" message, so if that appears after
 `playwright install chromium` has already run, check for a
 playwright/Chromium version mismatch before chasing anything else.
 
+## Transferring files
+
+`jsonyter` already straddles both filesystems — it runs as a subprocess of the
+editor (ordinary local disk) and it is authenticated against the Jupyter
+server's Contents API (the server's disk) — so a data file can move between
+them without dropping to `scp`/`rclone`/the Lab UI. The chunking, hashing and
+file I/O happen in Python; only progress counters cross the pipe.
+
+```python
+import jsonyter
+
+client = jsonyter.Client("https://jupyter.example.com", token="SECRET")
+
+up = jsonyter.upload(client, "/home/e/trials.csv", "data/trials.csv")
+# {"path": "data/trials.csv", "local_path": "/home/e/trials.csv",
+#  "bytes": 193273528, "chunks": 24, "hash": "3f2a…", "hash_algorithm": "sha256",
+#  "verified": "sha256", "resumed_at": 0, "resume_note": null, "elapsed": 41.2}
+
+jsonyter.download(client, "data/trials.csv", "/home/e/trials-copy.csv")
+# same shape, plus "transport": "files" | "contents"
+```
+
+**Uploads are chunked, and that is not optional.** A gateway such as
+Cloudflare caps the request body at 100 MB by default (200 MB Business, up to
+5 GB Enterprise); a base64 body is 4/3 the raw size, so the safe ceiling is
+~74 MB. The default chunk is **8 MiB** — well below the ceiling so memory,
+progress granularity and the retry unit all stay small. Override it per call
+with `chunk_size=` or bridge-wide with `--chunk-size`; anything over the safe
+maximum is refused before a byte is sent.
+
+**Downloads use a different route.** A whole-file `GET /api/contents`
+base64-encodes and JSON-serialises the entire file before the first byte
+leaves the server, which can trip a proxy's time-to-first-byte limit, so
+`download` streams raw bytes from `/files/<path>` with HTTP `Range` instead —
+no base64 tax, no timeout, and resumable. When `/files/` will not serve a
+`206` (a non-file-backed contents manager — S3 and friends), it falls back to
+the Contents API with `format=base64`; `transport` in the result says which
+path ran.
+
+**Both directions verify with a hash.** `GET /api/contents/<path>?content=0&hash=1`
+(jupyter_server ≥ 2.11) returns a sha256 without transferring the file, and it
+is compared against the local digest. An older server has no such hash, so the
+check degrades to file size and the result says `"verified": "size"` instead
+of `"sha256"`; a verification request that times out reports
+`"verified": "unverified"` rather than failing the transfer.
+
+**Resume is an optimisation, never the correctness argument.** `resume=True`
+continues a partial upload when the server-side size is a whole number of
+chunks (it appends blindly, so a partial chunk means restart-from-scratch —
+`resume_note` says why); downloads resume against a local `.part` file, which
+is `os.replace`d onto the real name only once the hash checks out, so an
+interrupted download never leaves a truncated file at the real path.
+
+**Conflicts reuse the `NotebookConflict` pattern.** `TransferConflict` (a
+`JupyterError`) carries `path`/`expected_hash`/`actual_hash` plus a `reason`
+so the front end can offer the right recovery:
+
+```python
+from jsonyter import TransferConflict
+try:
+    jsonyter.upload(client, "trials.csv", "data/trials.csv")
+except TransferConflict as err:
+    err.reason      # "exists"  -> pass overwrite=True (or resume=True)
+                    # "stale"   -> expect_hash didn't match; download it first
+                    # "corrupt" -> the bytes that landed are wrong; retry/resume
+```
+
+Pass `overwrite=True` to replace a destination, or `expect_hash=<sha256>` as a
+staleness guard — a mismatch raises `reason="stale"` rather than clobbering a
+file that moved under you.
+
+A transfer that dies mid-flight fails with the numbers and the recovery
+spelled out, and says whether the proxy or the Jupyter server refused:
+
+```
+upload of data/trials.csv failed at chunk 7/23 (12.4 MB of 184.0 MB written)
+— Payload Too Large — HTTP 413 from the proxy (cf-ray 8a… present), not from
+the Jupyter server — lower --chunk-size (currently 64.0 MB, ceiling ~74 MB),
+then resume from byte 13008896
+```
+
+### The thin Contents API verbs
+
+`upload`/`download` are built on plain wrappers over the Jupyter Contents API,
+exposed on `Client` (and the bridge) in their own right:
+
+| Method | Endpoint |
+| --- | --- |
+| `get_contents(path, content, type, format, hash)` | `GET /api/contents/<path>` |
+| `put_contents(path, content, type, format, chunk)` | `PUT /api/contents/<path>` |
+| `make_directory(path)` | `PUT` with `{"type": "directory"}` (names it exactly) |
+| `delete_contents(path)` | `DELETE /api/contents/<path>` |
+| `rename_contents(path, new_path)` | `PATCH` — old path in URL, new in body; move == rename |
+| `copy_contents(path, to_dir)` | `POST` with `copy_from` — server-side, no bytes on the wire |
+| `list_contents(path)` | `get_contents` on a directory |
+
+### Kernel working directory vs. Contents paths
+
+Contents paths are POSIX-style, relative to the server's `root_dir`, with no
+leading slash. The kernel's working directory is a *different coordinate
+system* and no API reports `root_dir`, so `kernel_contents_dir` learns the
+mapping once per kernel: it asks the kernel for its cwd, has it drop an empty
+`.jsonyter-probe-<uuid>` there, then walks the cwd's path suffixes
+longest-first and takes the first Contents listing that actually contains the
+sentinel.
+
+```python
+jsonyter.kernel_contents_dir(client, kernel_id)
+# {"kernel_id": "...", "cwd": "/home/jovyan/work/analysis",
+#  "contents_dir": "work/analysis", "root_dir": "/home/jovyan",
+#  "method": "probe", "language": "python"}
+```
+
+`method` is `"probe"`, `"configured"` (you passed `root=` and the probe was
+skipped), `"unresolved"` (no suffix resolved — the kernel is outside
+`root_dir`; `contents_dir` is `null`, never a guess) or `"unsupported"` (no
+snippet for the kernel's language — Python, R and Julia are covered; anything
+else is not an error). On the bridge the result is cached per kernel and
+dropped on restart/shutdown.
+
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
@@ -494,6 +614,7 @@ is not `result`/`error` is out-of-band and does not complete the request:
 | `output` | incremental output from a running `execute` |
 | `input_request` | the kernel wants stdin; reply before it can finish |
 | `event` | async kernel state, after `subscribe` |
+| `progress` | transfer progress from a running `upload`/`download` (rate-limited to ~4/s; the last one has `bytes_done == bytes_total`) |
 
 ### Concurrency
 
@@ -566,7 +687,8 @@ either.
 | Server | `status`, `version` |
 | Kernels (REST) | `list_kernelspecs`, `list_kernels`, `start_kernel`, `get_kernel`, `shutdown_kernel`, `restart_kernel`, `interrupt_kernel` |
 | Sessions | `list_sessions`, `create_session`, `get_session`, `delete_session` |
-| Contents | `get_contents` |
+| Contents | `get_contents`, `put_contents`, `make_directory`, `delete_contents`, `rename_contents`, `copy_contents`, `list_contents` |
+| File transfer | `upload`, `download`, `kernel_contents_dir` (module functions / bridge methods, not `Client` methods) |
 | Notebooks (local files) | `read_notebook`, `write_notebook`, `notebook_hash` |
 | Export | `list_export_formats`, `export_notebook` |
 | Kernel (WebSocket) | `execute`, `complete`, `inspect`, `is_complete`, `kernel_info`, `history` |

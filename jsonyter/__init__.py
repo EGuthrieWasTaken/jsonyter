@@ -10,9 +10,12 @@ from .client import Client, JupyterError
 from .export import ExportError
 from .kernel import KernelConnection
 from .notebook import NotebookConflict, file_hash, read_notebook, write_notebook
+from .transfer import (DEFAULT_CHUNK_SIZE, MAX_SAFE_CHUNK_SIZE, TransferConflict,
+                       download, kernel_contents_dir, upload)
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 __all__ = ["Client", "KernelConnection", "JupyterError", "NotebookConflict",
-           "ExportError", "read_notebook", "write_notebook", "file_hash",
-           "__version__"]
+           "ExportError", "TransferConflict", "read_notebook", "write_notebook",
+           "file_hash", "upload", "download", "kernel_contents_dir",
+           "DEFAULT_CHUNK_SIZE", "MAX_SAFE_CHUNK_SIZE", "__version__"]
