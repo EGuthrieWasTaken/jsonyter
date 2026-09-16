@@ -20,7 +20,7 @@ from .sync import SyncRefused, sync, sync_apply, sync_plan, sync_status
 from .transfer import (DEFAULT_CHUNK_SIZE, MAX_SAFE_CHUNK_SIZE, TransferConflict,
                        download, kernel_contents_dir, upload)
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = ["Client", "KernelConnection", "JupyterError", "NotebookConflict",
            "ExportError", "TransferConflict", "SyncRefused", "read_notebook",
