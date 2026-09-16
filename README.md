@@ -578,6 +578,88 @@ snippet for the kernel's language — Python, R and Julia are covered; anything
 else is not an error). On the bridge the result is cached per kernel and
 dropped on restart/shutdown.
 
+## Directory sync
+
+`upload`/`download` move one file at a time; `sync` reconciles a whole local
+directory against a Contents-API directory — the case a data-driven project
+actually has: local inputs and kernel-written outputs sharing a tree that both
+ends touch. Every sync is explicit and one-shot — there is no watching, no
+daemon, no polling loop.
+
+```python
+import jsonyter
+
+client = jsonyter.Client("https://jupyter.example.com", token="SECRET")
+
+result = jsonyter.sync(client, "/home/e/project/data", "work/data")
+# {"ok": true, "moved": {"pushed": 3, "pulled": 5, "converged": 1,
+#                        "deleted_local": 0, "deleted_remote": 0},
+#  "bytes_up": 193273528, "bytes_down": 4211, "skipped": 110,
+#  "conflicts_unresolved": 0, "failed": [], "conflict_copies": [],
+#  "integrity": "sha256", "elapsed": 31.8, "baseline": "/home/e/.local/state/..."}
+```
+
+**Direction is a property of a change, not of a file.** A naive "upload
+everything, then download everything" ping-pongs on every file present on
+both sides. Instead, `sync` keeps a **baseline** — the (path, hash) set as of
+the last successful sync of this pair, in a small JSON file under
+`$XDG_STATE_HOME/jsonyter/sync/` — and compares local, remote and baseline
+three-way. Only a baseline can say *which side* changed, which is what
+separates a routine one-sided update (push/pull, automatic) from a genuine
+conflict (both sides changed since the baseline, or one side changed while
+the other deleted it).
+
+**Split plan from apply**, so a front end can review before anything moves:
+
+```python
+plan = jsonyter.sync_plan(client, "/home/e/project/data", "work/data")
+# read-only; plan["entries"] lists every path with an "action"
+# ("push"/"pull"/"converge"/"skip"/"conflict"/"push-delete"/"pull-delete")
+# and a stable "reason" token ("local-changed", "both-changed", ...)
+
+result = jsonyter.sync_apply(client, plan)
+```
+
+`sync_status` is `sync_plan` with `delete="none"`, under a name that promises
+no writes. `sync(...)` is `sync_plan` + `sync_apply` in one call, for
+non-interactive use — note that its `conflict` default is `"newest"`, not
+`"ask"`: a caller that cannot answer a question should not be asked one.
+
+**Conflicts** get an explicit policy rather than a default buried in the
+code — `conflict=` is one of `"ask"` (the `sync_plan` default; the entry comes
+back with `action: "conflict"` for the front end to resolve), `"newest"`
+(later `mtime` wins, correcting for measured clock skew between your machine
+and the server; a call too close to call — within the skew or 5 seconds,
+whichever is larger — is left unresolved rather than guessed), `"local"` /
+`"remote"` (a fixed side always wins), or `"skip"` (leave both alone, report
+it). Whichever side loses a conflict is renamed aside first
+(`notes.md.jsonyter-conflict-<timestamp>`, reported in `conflict_copies`)
+rather than silently overwritten — cheap insurance, and what makes `"newest"`
+an acceptable default at all.
+
+**Deletions are opt-in.** `delete=` defaults to `"none"`: a file missing on
+one side is reported (`local_missing`/`remote_missing`) and left alone.
+`"push"`/`"pull"`/`"both"` propagate a deletion once a baseline can actually
+attribute it — a first sync never deletes, since without a baseline "gone" and
+"not yet created" look identical. A plan that would delete more than
+`max_deletes` (default 25) refuses with `SyncRefused` naming the count — the
+guard against an unmounted volume or a wrong `local_dir` reading as "delete
+everything."
+
+**Ignore patterns**: `.git/`, `__pycache__/`, `.ipynb_checkpoints/` and a few
+others are excluded by default (a whole ignored directory is pruned, never
+listed), plus whatever you pass as `ignore=` and an optional
+`.jsonyterignore` file (one `fnmatch` pattern per line, `#` comments) at the
+root of `local_dir`.
+
+From the shell, for a cron entry or a script:
+
+```bash
+jsonyter --url https://jupyter.example.com sync ~/project/data work/data \
+    --conflict newest --delete none
+jsonyter sync ~/project/data work/data --dry-run   # sync_plan only
+```
+
 ## The JSON stdio bridge (for Emacs)
 
 ```bash
@@ -614,7 +696,7 @@ is not `result`/`error` is out-of-band and does not complete the request:
 | `output` | incremental output from a running `execute` |
 | `input_request` | the kernel wants stdin; reply before it can finish |
 | `event` | async kernel state, after `subscribe` |
-| `progress` | transfer progress from a running `upload`/`download` (rate-limited to ~4/s; the last one has `bytes_done == bytes_total`) |
+| `progress` | transfer progress from a running `upload`/`download`/`sync_apply`/`sync` (rate-limited to ~4/s; the last one has `bytes_done == bytes_total`); a sync also emits a `"phase": "scan"` line, with no byte counters, while walking the two trees |
 
 ### Concurrency
 
@@ -689,6 +771,7 @@ either.
 | Sessions | `list_sessions`, `create_session`, `get_session`, `delete_session` |
 | Contents | `get_contents`, `put_contents`, `make_directory`, `delete_contents`, `rename_contents`, `copy_contents`, `list_contents` |
 | File transfer | `upload`, `download`, `kernel_contents_dir` (module functions / bridge methods, not `Client` methods) |
+| Directory sync | `sync_plan`, `sync_apply`, `sync`, `sync_status`, `cancel_sync` (module functions / bridge methods, not `Client` methods) |
 | Notebooks (local files) | `read_notebook`, `write_notebook`, `notebook_hash` |
 | Export | `list_export_formats`, `export_notebook` |
 | Kernel (WebSocket) | `execute`, `complete`, `inspect`, `is_complete`, `kernel_info`, `history` |

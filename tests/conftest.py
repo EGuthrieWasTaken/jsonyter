@@ -9,10 +9,12 @@ the real thing.
 """
 
 import base64
+import datetime
 import hashlib
 import json
 import posixpath
 import re
+import time
 import urllib.parse
 
 import pytest
@@ -22,6 +24,10 @@ import jsonyter
 
 
 TS = "2026-09-07T14:22:00.000000Z"
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 # --------------------------------------------------------------- fake HTTP
@@ -93,6 +99,8 @@ class FakeContentsServer:
     def __init__(self):
         self.files = {}             # "a/b.csv" -> bytearray
         self.dirs = {""}            # contents paths known to be directories
+        self.mtimes = {}            # cpath -> ISO timestamp, set on every save
+        self.hash_algorithm = "sha256"  # server's ContentsManager.hash_algorithm
         self.no_hash = False        # simulate jupyter_server < 2.11
         self.corrupt_hash = False   # return a wrong digest
         self.ignore_range = False   # /files/ answers 200 to any Range
@@ -103,22 +111,51 @@ class FakeContentsServer:
         self.range_200_after = None  # honour the probe, then answer 200 to ranges
         self.range_error_after = None  # (n, status, headers): range n+1 errors
         self._range_count = 0
+        self.date_header = None     # override the response Date header
+        self._mtime_seq = 0
 
     # -- helpers ------------------------------------------------------------
+
+    def touch(self, cpath):
+        """Give ``cpath`` a fresh, strictly-increasing ``last_modified``.
+
+        Every real save does this implicitly; exposed so a test can move a
+        file's clock without changing its bytes (a same-content "edit").
+        Anchored to real wall-clock time (offset by a small increasing
+        counter to guarantee ordering between calls in the same instant) so
+        it stays on the same timescale as local files' real ``os.stat``
+        mtimes — a sync test comparing the two needs them comparable.
+        """
+        self._mtime_seq += 1
+        return self.set_mtime(cpath, time.time() + self._mtime_seq)
+
+    def set_mtime(self, cpath, epoch_seconds):
+        """Set an exact ``last_modified`` from a Unix timestamp.
+
+        For a test that needs precise control over the ordering between a
+        remote and a local mtime (e.g. exercising ``conflict="newest"``).
+        """
+        self.mtimes[cpath] = _iso(
+            datetime.datetime.fromtimestamp(epoch_seconds, tz=datetime.timezone.utc))
+        return self.mtimes[cpath]
 
     def _digest(self, data):
         if self.corrupt_hash:
             return "0" * 64
-        return hashlib.sha256(bytes(data)).hexdigest()
+        return hashlib.new(self.hash_algorithm, bytes(data)).hexdigest()
+
+    def _mtime(self, cpath):
+        return self.mtimes.get(cpath, TS)
 
     def _file_model(self, cpath, want_content, want_hash, fmt):
         data = self.files[cpath]
         model = {"type": "file", "name": posixpath.basename(cpath),
-                 "path": cpath, "size": len(data), "last_modified": TS,
+                 "path": cpath, "size": len(data),
+                 "last_modified": self._mtime(cpath),
                  "writable": True, "format": None, "content": None}
         if want_hash and not self.no_hash:
             model["hash"] = self._digest(data)
-            model["hash_algorithm"] = "sha256"
+            model["hash_algorithm"] = self.hash_algorithm
         if want_content:
             if fmt == "base64":
                 model["format"] = "base64"
@@ -129,18 +166,34 @@ class FakeContentsServer:
         return model
 
     def _children(self, cpath):
+        """Direct children of ``cpath``, files and directories alike.
+
+        Subdirectories are reported whether or not they were ever
+        explicitly created via ``make_directory`` — a nested file save
+        auto-creates its parents on disk on a real, filesystem-backed
+        contents manager, so a subdirectory that only "exists" because a
+        file lives under it must still show up in a listing.
+        """
         prefix = cpath + "/" if cpath else ""
         out = []
+        implicit_dirs = set()
         for f, data in self.files.items():
-            if f.startswith(prefix) and "/" not in f[len(prefix):]:
+            if not f.startswith(prefix):
+                continue
+            rest = f[len(prefix):]
+            if "/" not in rest:
                 out.append({"type": "file", "name": posixpath.basename(f),
                             "path": f, "size": len(data),
-                            "last_modified": TS, "writable": True})
+                            "last_modified": self._mtime(f), "writable": True})
+            else:
+                implicit_dirs.add(rest.split("/", 1)[0])
         for d in self.dirs:
             if d and d.startswith(prefix) and "/" not in d[len(prefix):]:
-                out.append({"type": "directory", "name": posixpath.basename(d),
-                            "path": d, "size": None, "last_modified": TS,
-                            "writable": True})
+                implicit_dirs.add(d[len(prefix):])
+        for seg in implicit_dirs:
+            out.append({"type": "directory", "name": seg,
+                        "path": prefix + seg, "size": None,
+                        "last_modified": TS, "writable": True})
         return out
 
     def _dir_model(self, cpath, want_content):
@@ -152,6 +205,12 @@ class FakeContentsServer:
     # -- routing ----------------------------------------------------------
 
     def handle(self, method, path, query, body, headers, url):
+        response = self._handle(method, path, query, body, headers, url)
+        if self.date_header is not None:
+            response.headers.setdefault("Date", self.date_header)
+        return response
+
+    def _handle(self, method, path, query, body, headers, url):
         if self.force is not None:
             status, jb, hh = self.force
             return FakeResponse(status, json_body=jb, headers=hh, url=url,
@@ -172,12 +231,25 @@ class FakeContentsServer:
         return FakeResponse(status, json_body={"message": msg}, url=url,
                             reason=msg)
 
+    def _is_implicit_dir(self, cpath):
+        """A directory that is not explicitly registered but "exists" the
+        way a real filesystem-backed contents manager would: something is
+        saved under it, because saving a nested file auto-creates its
+        parent directories on disk. Mirroring that here matters for
+        anything (like a directory sync) that lists a path right after
+        writing a file under it, without ever having called
+        ``make_directory`` on the intermediate path itself.
+        """
+        prefix = cpath + "/" if cpath else ""
+        return (any(f.startswith(prefix) for f in self.files)
+                or any(d != cpath and d.startswith(prefix) for d in self.dirs))
+
     def _contents(self, method, cpath, query, body, url):
         if method == "GET":
             want_content = query.get("content", "1") == "1"
             want_hash = query.get("hash") == "1"
             fmt = query.get("format")
-            if cpath in self.dirs:
+            if cpath in self.dirs or self._is_implicit_dir(cpath):
                 return FakeResponse(200,
                                     json_body=self._dir_model(cpath, want_content),
                                     url=url)
@@ -209,6 +281,7 @@ class FakeContentsServer:
                 self.files[cpath] = bytearray(raw)
             else:
                 self.files.setdefault(cpath, bytearray()).extend(raw)
+            self.touch(cpath)
             return FakeResponse(201,
                                 json_body=self._file_model(cpath, False, False,
                                                            None),
@@ -220,6 +293,8 @@ class FakeContentsServer:
             if cpath not in self.files:
                 return self._err(404, "No such file: " + cpath, url)
             self.files[new] = self.files.pop(cpath)
+            if cpath in self.mtimes:
+                self.mtimes[new] = self.mtimes.pop(cpath)
             return FakeResponse(200,
                                 json_body=self._file_model(new, False, False,
                                                            None),
@@ -234,6 +309,7 @@ class FakeContentsServer:
             name = "{}-Copy1{}{}".format(stem, dot, ext)
             dest = (cpath + "/" + name) if cpath else name
             self.files[dest] = bytearray(self.files[src])
+            self.touch(dest)
             return FakeResponse(201,
                                 json_body=self._file_model(dest, False, False,
                                                            None),
@@ -242,6 +318,7 @@ class FakeContentsServer:
         if method == "DELETE":
             self.files.pop(cpath, None)
             self.dirs.discard(cpath)
+            self.mtimes.pop(cpath, None)
             return FakeResponse(204, url=url)
 
         return self._err(405, "method not allowed", url)

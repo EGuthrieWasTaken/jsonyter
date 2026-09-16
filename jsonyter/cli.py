@@ -65,6 +65,21 @@ Available methods (params in parentheses):
   (``kernel_id``, ``root``) — chunked single-file transfer, on the REST pool
   so a big transfer never queues behind a running ``execute``; ``upload``/
   ``download`` emit ``progress`` lines while running
+- ``sync_plan`` (``local_dir``, ``remote_dir``, ``ignore``, ``conflict``,
+  ``delete``, ``state_path``, ``rehash``, ``max_files``, ``max_deletes``,
+  ``follow_links``), ``sync_apply`` (``plan``, ``overrides``, ``chunk_size``,
+  ``keep_conflict_copies``), ``sync`` (``local_dir``, ``remote_dir``,
+  ``conflict``, ``delete``, ``ignore``, ``state_path``, ``chunk_size``,
+  ``rehash``), ``sync_status`` (``local_dir``, ``remote_dir``,
+  ``state_path``) — bidirectional directory sync against a baseline (see
+  :mod:`jsonyter.sync`); ``sync_apply``/``sync`` emit ``progress`` lines
+  shaped like upload/download's but with ``"phase": "sync"`` and extra
+  ``op``/``file_index``/``files_total``/``files_done``/``sync_bytes_done``/
+  ``sync_bytes_total`` keys, plus a ``"phase": "scan"`` line (no byte
+  counters) while walking the two trees. ``cancel_sync`` (``request_id``)
+  requests cooperative cancellation of an in-flight ``sync_apply``/``sync``
+  by the id of *that* request; it takes effect between files, and the
+  result comes back with ``"cancelled": true``.
 """
 
 import argparse
@@ -77,6 +92,12 @@ import time
 
 from . import transfer
 from .client import Client, JupyterError
+# Imported by name, not ``from . import sync``: ``jsonyter/__init__.py``
+# re-exports the ``sync`` *function* from this same submodule, which would
+# shadow the submodule itself on the ``jsonyter`` package object.
+from .sync import (CONFLICT_POLICIES, DEFAULT_MAX_DELETES, DEFAULT_MAX_FILES,
+                   DELETE_POLICIES, sync as run_sync, sync_apply, sync_plan,
+                   sync_status)
 
 # Client methods invocable directly, mapped to accepted params.
 _CLIENT_METHODS = {
@@ -105,6 +126,16 @@ _CLIENT_METHODS = {
     "download": ("remote_path", "local_path", "overwrite", "expect_hash",
                  "resume"),
     "kernel_contents_dir": ("kernel_id", "root"),
+    # Bidirectional directory sync (jsonyter.sync) — same REST pool, same
+    # reason: a multi-file sync must never queue behind a running execute.
+    "sync_plan": ("local_dir", "remote_dir", "ignore", "conflict", "delete",
+                 "state_path", "rehash", "max_files", "max_deletes",
+                 "follow_links"),
+    "sync_apply": ("plan", "overrides", "chunk_size", "keep_conflict_copies"),
+    "sync": ("local_dir", "remote_dir", "conflict", "delete", "ignore",
+            "state_path", "chunk_size", "rehash"),
+    "sync_status": ("local_dir", "remote_dir", "state_path"),
+    "cancel_sync": ("request_id",),
     # Local filesystem, no server contact — and not on a kernel worker, so a
     # save never queues behind a running execute.
     "read_notebook": ("path",),
@@ -147,6 +178,7 @@ class Dispatcher:
         self._pending_input = {}    # request id -> Queue
         self._subscribed = {}       # kernel_id -> listener callable
         self._contents_dir_cache = {}   # kernel_id -> kernel_contents_dir result
+        self._cancelled = set()     # request ids a cancel_sync was asked for
         self._stopping = False
 
     # ----------------------------------------------------------------- output
@@ -285,6 +317,27 @@ class Dispatcher:
         return fn(self.client, progress=self._progress_emitter(request_id),
                   **kwargs)
 
+    def _run_sync(self, method, request_id, kwargs):
+        fn = {"sync_plan": sync_plan, "sync_status": sync_status,
+             "sync_apply": sync_apply, "sync": run_sync}[method]
+        if method in ("sync_apply", "sync"):
+            kwargs.setdefault("chunk_size", self.default_chunk_size)
+            kwargs["should_cancel"] = lambda: request_id in self._cancelled
+        try:
+            return fn(self.client, progress=self._progress_emitter(request_id),
+                      **kwargs)
+        finally:
+            with self._state_lock:
+                self._cancelled.discard(request_id)
+
+    def _cancel_sync(self, kwargs):
+        target = kwargs.get("request_id")
+        if target is None:
+            raise JupyterError("missing required param: request_id")
+        with self._state_lock:
+            self._cancelled.add(target)
+        return {"request_id": target, "cancel_requested": True}
+
     def _kernel_contents_dir(self, kwargs):
         kernel_id = kwargs.get("kernel_id")
         if not kernel_id:
@@ -317,6 +370,10 @@ class Dispatcher:
                 result = self._run_transfer(method, request_id, kwargs)
             elif method == "kernel_contents_dir":
                 result = self._kernel_contents_dir(kwargs)
+            elif method in ("sync_plan", "sync_apply", "sync", "sync_status"):
+                result = self._run_sync(method, request_id, kwargs)
+            elif method == "cancel_sync":
+                result = self._cancel_sync(kwargs)
             else:
                 args = []
                 if "kernel_id" in kwargs:
@@ -526,6 +583,30 @@ def main(argv=None):
     parser.add_argument("--pretty", action="store_true",
                         help="indent JSON responses (for humans; breaks the "
                              "one-line-per-response protocol editors rely on)")
+
+    subparsers = parser.add_subparsers(dest="command")
+    sync_parser = subparsers.add_parser(
+        "sync", help="one-shot bidirectional directory sync, usable from a "
+                     "shell script or cron entry (omit this subcommand to "
+                     "run the JSON-over-stdio bridge instead)")
+    sync_parser.add_argument("local_dir")
+    sync_parser.add_argument("remote_dir")
+    sync_parser.add_argument("--conflict", choices=CONFLICT_POLICIES,
+                             default="newest")
+    sync_parser.add_argument("--delete", choices=DELETE_POLICIES,
+                             default="none")
+    sync_parser.add_argument("--dry-run", action="store_true",
+                             help="sync_plan only — print the plan and exit "
+                                  "without moving anything")
+    sync_parser.add_argument("--rehash", action="store_true",
+                             help="hash both trees in full, bypassing the "
+                                  "baseline trust cache")
+    sync_parser.add_argument("--max-deletes", type=int,
+                             default=DEFAULT_MAX_DELETES)
+    sync_parser.add_argument("--max-files", type=int,
+                             default=DEFAULT_MAX_FILES)
+    sync_parser.add_argument("--state-path", default=None, metavar="PATH")
+
     args = parser.parse_args(argv)
 
     if (args.chunk_size is not None
@@ -542,6 +623,10 @@ def main(argv=None):
                     verify_tls=not args.insecure,
                     export_timeout=args.export_timeout,
                     transfer_timeout=args.transfer_timeout)
+
+    if args.command == "sync":
+        return _run_sync_cli(client, args)
+
     dispatcher = Dispatcher(client, pretty=args.pretty, stream=args.stream,
                             chunk_size=args.chunk_size)
     try:
@@ -551,6 +636,72 @@ def main(argv=None):
     finally:
         dispatcher.shutdown()
     return 0
+
+
+def _human_bytes(n):
+    if n < 1024:
+        return "{} B".format(n)
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024 or unit == "TB":
+            return "{:.1f} {}".format(n, unit)
+
+
+def _print_plan_table(plan):
+    print("sync plan: {} <-> {} ({} integrity)".format(
+        plan["local_dir"], plan["remote_dir"], plan["integrity"]))
+    for entry in plan["entries"]:
+        extra = ""
+        if entry["action"] == "conflict":
+            extra = " [{}]".format(entry.get("resolution") or "unresolved")
+        print("  {:<12} {:<16} {}{}".format(
+            entry["action"], entry["reason"], entry["path"], extra))
+    totals = plan["totals"]
+    print("totals: push={push} pull={pull} converge={converge} skip={skip} "
+          "conflict={conflict} push_delete={push_delete} "
+          "pull_delete={pull_delete} ({up} up, {down} down)".format(
+              up=_human_bytes(totals["bytes_up"]),
+              down=_human_bytes(totals["bytes_down"]), **totals))
+    for warning in plan["warnings"]:
+        print("warning: " + warning)
+
+
+def _print_sync_result(result):
+    moved = result["moved"]
+    print("sync {} (pushed {}, pulled {}, converged {}, deleted "
+          "{} local / {} remote; {} up, {} down)".format(
+              "succeeded" if result["ok"] else "finished with problems",
+              moved["pushed"], moved["pulled"], moved["converged"],
+              moved["deleted_local"], moved["deleted_remote"],
+              _human_bytes(result["bytes_up"]), _human_bytes(result["bytes_down"])))
+    if result.get("cancelled"):
+        print("cancelled before completion; re-run to resume")
+    if result["conflicts_unresolved"]:
+        print("{} conflict(s) unresolved".format(result["conflicts_unresolved"]))
+    for failure in result["failed"]:
+        print("failed: {} — {}".format(failure["path"], failure["error"]))
+    for copy in result["conflict_copies"]:
+        print("kept conflict copy: " + copy)
+
+
+def _run_sync_cli(client, args):
+    try:
+        plan = sync_plan(
+            client, args.local_dir, args.remote_dir, conflict=args.conflict,
+            delete=args.delete, rehash=args.rehash,
+            max_deletes=args.max_deletes, max_files=args.max_files,
+            state_path=args.state_path)
+    except JupyterError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        _print_plan_table(plan)
+        return 0
+
+    result = sync_apply(client, plan, chunk_size=args.chunk_size)
+    _print_sync_result(result)
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":

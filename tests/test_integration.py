@@ -8,6 +8,7 @@ set, e.g.::
         pytest tests/test_integration.py -q
 """
 
+import base64
 import hashlib
 import os
 
@@ -48,3 +49,42 @@ def test_live_upload_download_round_trip(live_client, tmp_path):
     finally:
         live_client.delete_contents(remote)
         live_client.delete_contents("jsonyter-itest")
+
+
+def test_live_sync_round_trips_a_small_tree_in_both_directions(live_client,
+                                                                tmp_path):
+    remote_dir = "jsonyter-itest-sync"
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "a.txt").write_bytes(b"pushed from local")
+    state_path = str(tmp_path / "state.json")
+
+    live_client.make_directory(remote_dir)
+    try:
+        result = jsonyter.sync(live_client, str(local), remote_dir,
+                               state_path=state_path)
+        assert result["ok"]
+        assert live_client.get_contents(
+            remote_dir + "/a.txt", content=True)["content"] == \
+            "pushed from local"
+
+        live_client.put_contents(
+            remote_dir + "/b.txt",
+            base64.b64encode(b"pulled from remote").decode(),
+            format="base64")
+        result2 = jsonyter.sync(live_client, str(local), remote_dir,
+                                state_path=state_path)
+        assert result2["ok"]
+        assert (local / "b.txt").read_bytes() == b"pulled from remote"
+
+        # A no-op third sync: nothing left to move.
+        result3 = jsonyter.sync(live_client, str(local), remote_dir,
+                                state_path=state_path)
+        assert result3["bytes_up"] == 0 and result3["bytes_down"] == 0
+    finally:
+        for name in ("a.txt", "b.txt"):
+            try:
+                live_client.delete_contents(remote_dir + "/" + name)
+            except jsonyter.JupyterError:
+                pass
+        live_client.delete_contents(remote_dir)
