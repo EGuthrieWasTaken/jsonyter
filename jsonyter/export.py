@@ -57,25 +57,61 @@ TOOLCHAIN_HINTS = {
     "qtpng":  "the 'qtpng' exporter needs pyqtwebengine on the Jupyter server",
 }
 
+# Substrings (matched case-insensitively) that actually identify a missing
+# toolchain, per format — as opposed to any other reason nbconvert can fail.
+# A hint is only attached when the server's own message matches one of these;
+# otherwise it would be a guess presented as a diagnosis (a LaTeX compile
+# error in the user's own content produces a 500 too, and pinning that on a
+# missing install sends the user chasing an install that is already there).
+_TOOLCHAIN_SIGNATURES = {
+    "pdf":    ("pandoc wasn't found", "pandoc not found", "latexfailed",
+              "xelatex not found", "xelatex: not found"),
+    "latex":  ("pandoc wasn't found", "pandoc not found"),
+    "webpdf": ("playwright is not installed", "no suitable chromium executable found"),
+    "qtpdf":  ("pyqtwebengine", "pyqt"),
+    "qtpng":  ("pyqtwebengine", "pyqt"),
+}
+
+
+def _toolchain_hint(format, detail):
+    """``TOOLCHAIN_HINTS[format]`` only when ``detail`` looks like the
+    toolchain actually being the problem; ``None`` otherwise."""
+    signatures = _TOOLCHAIN_SIGNATURES.get(format)
+    if not signatures or not detail:
+        return None
+    lowered = detail.lower()
+    if any(signature in lowered for signature in signatures):
+        return TOOLCHAIN_HINTS.get(format)
+    return None
+
 _MAX_ERROR_DETAIL = 2000
 _TRACEBACK_RE = re.compile(r'<pre class="traceback">(.*?)</pre>', re.S)
 _H1_RE = re.compile(r'<h1>(.*?)</h1>')
 
 
 class ExportError(JupyterError):
-    """An export could not be produced, with the server's own reason."""
+    """An export could not be produced, with the server's own reason.
+
+    ``reason="exists"`` (with ``paths`` set) marks the one case that isn't a
+    server failure at all: the export would overwrite local file(s) that
+    ``overwrite=True`` wasn't passed for. Sibling of
+    :class:`~jsonyter.transfer.TransferConflict`.
+    """
 
     def __init__(self, message, status=None, url=None, format=None,
-                hint=None, available_formats=None):
+                hint=None, available_formats=None, reason=None, paths=None):
         super().__init__(message, status=status, url=url)
         self.format = format
         self.hint = hint
         self.available_formats = available_formats
+        self.reason = reason
+        self.paths = paths
 
     def to_json(self):
         payload = super().to_json()
         payload.update({"format": self.format, "hint": self.hint,
-                        "available_formats": self.available_formats})
+                        "available_formats": self.available_formats,
+                        "reason": self.reason, "paths": self.paths})
         return payload
 
 
@@ -110,8 +146,9 @@ def _error_detail(response):
 def list_export_formats(client):
     """Export formats this server offers, or why it offers none.
 
-    Never raises for an unavailable endpoint — it is a capability probe, not
-    an assertion that export works.
+    Never raises — it is a capability probe, not an assertion that export
+    works. Every status the server could plausibly answer with (including an
+    auth failure) folds into ``available=False`` plus a ``reason``.
     """
     response = client._request_raw("GET", "/api/nbconvert")
     status = response.status_code
@@ -121,12 +158,16 @@ def list_export_formats(client):
         return {"available": False, "formats": {},
                 "reason": "authentication failed: the server redirected to "
                           "its login page; check the token"}
+    if status in (401, 403):
+        return {"available": False, "formats": {},
+                "reason": "not authorized (HTTP {}): the server rejected "
+                          "the request; check the token".format(status)}
     if status == 404:
         return {"available": False, "formats": {},
                 "reason": "this server does not serve the nbconvert endpoints"}
     if status == 500:
         return {"available": False, "formats": {}, "reason": _error_detail(response)}
-    raise JupyterError(_error_detail(response), status=status, url=response.url)
+    return {"available": False, "formats": {}, "reason": _error_detail(response)}
 
 
 # ------------------------------------------------------------------ helpers
@@ -218,6 +259,16 @@ def _resource_mimetype(name):
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
+# jupyter_server's respond_zip sets exactly "application/zip", but a proxy or
+# fork may normalize the header; the magic-byte sniff is the real fallback,
+# since it is what a zip actually is, whatever the header claims.
+_ZIP_CONTENT_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
+
+
+def _looks_like_zip(ctype, body):
+    return ctype in _ZIP_CONTENT_TYPES or body[:4] == b"PK\x03\x04"
+
+
 def _inline_result(format, mimetype, extension, primary_bytes, resource_items,
                    bundle):
     encoding, content = _encode_body(primary_bytes, format)
@@ -268,7 +319,7 @@ def _atomic_write_bytes(data, path):
 
 
 def _write_to_path(format, mimetype, extension, primary_bytes, resource_items,
-                   document_stem, to_path, bundle):
+                   document_stem, to_path, bundle, overwrite):
     is_dir_target = (os.path.isdir(to_path) or to_path.endswith(os.sep)
                      or (os.altsep and to_path.endswith(os.altsep)))
     if is_dir_target:
@@ -278,11 +329,26 @@ def _write_to_path(format, mimetype, extension, primary_bytes, resource_items,
     primary_path = os.path.abspath(os.path.expanduser(primary_path))
     directory = os.path.dirname(primary_path) or "."
 
+    resource_writes = [(name, os.path.join(directory, name), data)
+                       for name, data in resource_items]
+
+    if not overwrite:
+        # Sidecar names come from nbconvert (output_0_0.png, ...), not from
+        # to_path, so two unrelated exports into the same directory collide
+        # by construction — check every path before writing any of them.
+        conflicts = [path for path in
+                     [primary_path] + [res_path for _, res_path, _ in resource_writes]
+                     if os.path.exists(path)]
+        if conflicts:
+            raise ExportError(
+                "export would overwrite existing file(s): {} — pass "
+                "overwrite=True to replace them".format(", ".join(conflicts)),
+                format=format, reason="exists", paths=conflicts)
+
     _atomic_write_bytes(primary_bytes, primary_path)
 
     resources = []
-    for name, data in resource_items:
-        res_path = os.path.join(directory, name)
+    for name, res_path, data in resource_writes:
         _atomic_write_bytes(data, res_path)
         resources.append({"name": name, "path": res_path, "bytes": len(data),
                           "sha256": hashlib.sha256(data).hexdigest()})
@@ -293,7 +359,7 @@ def _write_to_path(format, mimetype, extension, primary_bytes, resource_items,
             "bundle": bundle, "resources": resources}
 
 
-def _build_success(response, format, document_stem, to_path):
+def _build_success(response, format, document_stem, to_path, overwrite):
     body = response.content
     if not body:
         raise ExportError(
@@ -301,7 +367,7 @@ def _build_success(response, format, document_stem, to_path):
             status=response.status_code, url=response.url, format=format)
 
     ctype = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-    bundle = ctype == "application/zip"
+    bundle = _looks_like_zip(ctype, body)
 
     if bundle:
         primary_name, primary_bytes, resource_items = _unpack_bundle(
@@ -317,7 +383,8 @@ def _build_success(response, format, document_stem, to_path):
 
     if to_path:
         return _write_to_path(format, mimetype, extension, primary_bytes,
-                              resource_items, document_stem, to_path, bundle)
+                              resource_items, document_stem, to_path, bundle,
+                              overwrite)
     return _inline_result(format, mimetype, extension, primary_bytes,
                           resource_items, bundle)
 
@@ -346,7 +413,7 @@ def _raise_for_status(response, format, is_get, server_path):
             if detail.startswith(prefix):
                 detail = detail[len(prefix):]
             raise ExportError(detail, status=500, url=response.url,
-                              format=format, hint=TOOLCHAIN_HINTS.get(format))
+                              format=format, hint=_toolchain_hint(format, detail))
         # No traceback block: either an unknown format or a bare crash.
         # One follow-up probe tells them apart without slowing the happy path.
         return "probe_unknown_format"
@@ -366,14 +433,15 @@ def _handle_ambiguous_500(client, response, format):
     match = _H1_RE.search(response.text)
     message = _unescape_match(match) if match else _error_detail(response)
     raise ExportError(message, status=500, url=response.url, format=format,
-                      hint=TOOLCHAIN_HINTS.get(format))
+                      hint=_toolchain_hint(format, message))
 
 
 # ------------------------------------------------------------------- export
 
 def export_notebook(client, format=None, *, server_path=None, cells=None,
                     notebook=None, name=None, to_path=None,
-                    include_outputs=None, sanitize_html=None, timeout=None):
+                    include_outputs=None, sanitize_html=None, timeout=None,
+                    metadata=None, overwrite=False):
     """Export a notebook through the server's nbconvert endpoint.
 
     Exactly one of three sources is required:
@@ -396,6 +464,14 @@ def export_notebook(client, format=None, *, server_path=None, cells=None,
     ``sanitize_html`` only applies to ``server_path`` (the server offers it
     on GET only).
 
+    ``metadata`` only applies to ``cells``: the notebook it builds otherwise
+    has no notebook-level metadata at all (no ``kernelspec``, no
+    ``language_info``), which templates read from — a Markdown export, for
+    instance, needs ``language_info.name`` to label code fences. Pass the
+    notebook's real metadata dict to carry it across. ``server_path`` and
+    ``notebook`` already have their own metadata, so ``metadata`` is
+    rejected with either.
+
     A zip response (markdown-with-images, for example) is always unpacked:
     the primary document comes back as ``content``, and every sidecar file
     as an entry in ``resources``, keyed by the basename the document
@@ -404,8 +480,12 @@ def export_notebook(client, format=None, *, server_path=None, cells=None,
     With ``to_path``, the primary document (and any resources, alongside it)
     are written to disk instead of returned inline; the result then carries
     ``path``/``bytes``/``sha256`` per file instead of ``content``/``encoding``.
-    Writes are atomic (temp file + ``os.replace``) and overwrite same-named
-    files.
+    Writes are atomic (temp file + ``os.replace``). By default an export that
+    would overwrite an existing file — the primary document or a sidecar
+    resource, whose name comes from nbconvert and is not derived from
+    ``to_path`` — raises :class:`ExportError` (``reason="exists"``) naming
+    every colliding path, and nothing is written. Pass ``overwrite=True`` to
+    replace them.
 
     Raises :class:`ExportError` (a :class:`JupyterError`) for anything the
     server can't produce, with the server's own message recovered from its
@@ -429,6 +509,14 @@ def export_notebook(client, format=None, *, server_path=None, cells=None,
             "include_outputs does not apply to server_path: the server "
             "exports the file as it is stored")
 
+    if metadata is not None:
+        if cells is None:
+            raise JupyterError(
+                "metadata is only available with cells (server_path and "
+                "notebook already carry their own notebook metadata)")
+        if not isinstance(metadata, dict):
+            raise JupyterError("metadata must be an object")
+
     effective_timeout = timeout if timeout is not None else client.export_timeout
     document_stem = _document_stem(server_path, name)
 
@@ -446,6 +534,8 @@ def export_notebook(client, format=None, *, server_path=None, cells=None,
         if cells is not None:
             nbformat = _nbformat()
             nb = nbformat.v4.new_notebook()
+            if metadata is not None:
+                nb.metadata.update(metadata)
             specs = _validate_specs(cells, effective_include_outputs)
             _merge_cells(nb, specs, effective_include_outputs)
             content = nb
@@ -462,4 +552,4 @@ def export_notebook(client, format=None, *, server_path=None, cells=None,
     if outcome == "probe_unknown_format":
         _handle_ambiguous_500(client, response, format)
 
-    return _build_success(response, format, document_stem, to_path)
+    return _build_success(response, format, document_stem, to_path, overwrite)

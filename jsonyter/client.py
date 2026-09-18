@@ -401,14 +401,15 @@ class Client:
     @prettifiable
     def export_notebook(self, format=None, *, server_path=None, cells=None,
                         notebook=None, name=None, to_path=None,
-                        include_outputs=None, sanitize_html=None, timeout=None):
+                        include_outputs=None, sanitize_html=None, timeout=None,
+                        metadata=None, overwrite=False):
         """Export a notebook through the server's nbconvert endpoint."""
         from .export import export_notebook
         return export_notebook(
             self, format, server_path=server_path, cells=cells,
             notebook=notebook, name=name, to_path=to_path,
             include_outputs=include_outputs, sanitize_html=sanitize_html,
-            timeout=timeout)
+            timeout=timeout, metadata=metadata, overwrite=overwrite)
 
     # --------------------------------------------------------------- kernels'
     # websocket connections
