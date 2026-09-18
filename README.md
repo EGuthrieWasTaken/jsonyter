@@ -306,9 +306,10 @@ client.list_export_formats()
 ```
 
 `available: false` (with a `reason`) means the server doesn't serve
-nbconvert at all — nbconvert isn't installed, or a downstream server app has
-disabled the endpoints — rather than raising, since this is meant as a
-capability probe.
+nbconvert at all — nbconvert isn't installed, a downstream server app has
+disabled the endpoints, or the token was wrong/missing (401/403) — rather
+than raising, since this is meant as a capability probe: it never raises,
+whatever the server answers with.
 
 Export has two modes, picked by which of `server_path`/`cells`/`notebook`
 you pass (exactly one is required):
@@ -392,7 +393,12 @@ UTF-8 (binary formats are always base64, regardless).
 
 Pass `to_path` to write the result to disk instead of returning it inline —
 resources are always written alongside the primary file, under their own
-basenames, overwriting same-named files:
+basenames. Sidecar names come from nbconvert (`output_0_0.png`, ...), not
+from `to_path`, so two unrelated exports into the same directory would
+collide; by default `export_notebook` refuses to overwrite the primary
+document *or* any sidecar, raising `ExportError` (`err.reason == "exists"`,
+`err.paths` naming every colliding path) before writing anything. Pass
+`overwrite=True` to replace them:
 
 ```python
 client.export_notebook("markdown", server_path="withimage.ipynb",
@@ -409,6 +415,20 @@ filename is derived from `name`/`server_path` instead. Writes go to a temp
 file in the destination directory and are moved into place with
 `os.replace`, same as `write_notebook`, so an interrupted export can't
 truncate an existing file.
+
+**`cells=` builds a notebook with no notebook-level metadata** — no
+`kernelspec`, no `language_info` — since it starts from
+`nbformat.v4.new_notebook()`. Templates read that metadata (a Markdown
+export needs `language_info.name` to label its code fences); pass the real
+notebook's metadata through `metadata=` to carry it across:
+
+```python
+nb = client.read_notebook("analysis.ipynb")
+client.export_notebook("markdown", cells=[...], metadata=nb["metadata"])
+```
+
+`metadata` only applies to `cells` — `server_path` and `notebook` already
+carry their own.
 
 A failed export raises `ExportError` (a `JupyterError`) with the server's
 own message recovered from its HTML error page — never the page itself:

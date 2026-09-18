@@ -51,9 +51,14 @@ Available methods (params in parentheses):
   usable offline
 - ``list_export_formats`` (), ``export_notebook`` (``format``,
   ``server_path``, ``cells``, ``notebook``, ``name``, ``to_path``,
-  ``include_outputs``, ``sanitize_html``, ``timeout``) — nbconvert export via
-  the server; both run on the REST pool, never a kernel worker, so a long
-  export cannot queue behind a running ``execute``
+  ``include_outputs``, ``sanitize_html``, ``timeout``, ``metadata``,
+  ``overwrite``) — nbconvert export via the server; both run on the REST
+  pool, never a kernel worker, so a long export cannot queue behind a
+  running ``execute``. ``metadata`` (with ``cells`` only) carries notebook
+  metadata (``kernelspec``, ``language_info``) into the built notebook.
+  ``overwrite`` (default ``false``, ``to_path`` only) must be passed to
+  replace an existing document or sidecar file — an export that would
+  otherwise clobber one fails naming every colliding path instead.
 - ``get_contents`` (``path``, ``content``, ``type``, ``format``, ``hash``),
   ``put_contents`` (``path``, ``content``, ``type``, ``format``, ``chunk``),
   ``make_directory`` (``path``), ``delete_contents`` (``path``),
@@ -143,7 +148,8 @@ _CLIENT_METHODS = {
     "notebook_hash": ("path",),
     "list_export_formats": (),
     "export_notebook": ("format", "server_path", "cells", "notebook", "name",
-                        "to_path", "include_outputs", "sanitize_html", "timeout"),
+                        "to_path", "include_outputs", "sanitize_html", "timeout",
+                        "metadata", "overwrite"),
 }
 
 _KERNEL_METHODS = {
